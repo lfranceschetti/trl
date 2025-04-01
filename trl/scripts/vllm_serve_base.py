@@ -90,7 +90,7 @@ class WeightSyncWorker(Worker):
     from a client process and distribute them to all worker processes participating in model inference.
     """
 
-    def __init__(*args, **kwargs):
+    def __init__(self, *args, **kwargs):
         if not is_vllm_available():
             raise ImportError(
                 "vLLM is required to use the WeightSyncWorker. Please install it using `pip install vllm`."
@@ -395,9 +395,7 @@ def main(script_args: ScriptArguments):
         guided_decoding_regex: Optional[str] = None
 
     class GenerateResponse(BaseModel):
-        completion_ids: list[list[int]]
-        messages: list[list[dict]]
-        mask: list[list[int]]
+        conversations: list[list[dict]]
 
     @app.post("/generate/", response_model=GenerateResponse)
     async def generate(request: GenerateRequest):
@@ -476,15 +474,9 @@ def main(script_args: ScriptArguments):
                 logger.error(f"Error communicating with partner model: {e}")
         
 
-        completion_ids = []
-        completion_masks = []
-        for conversation in conversations:
-            completion_ids, mask = tokenize_messages(conversation, tokenizer)
-            completion_ids.append(completion_ids)
-            completion_masks.append(mask)
 
 
-        return {"completion_ids": completion_ids, "messages": conversations, "mask": completion_masks}
+        return {"conversations": conversations}
 
 
 

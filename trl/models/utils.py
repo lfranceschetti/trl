@@ -226,6 +226,9 @@ def prepare_deepspeed(model, accelerator):
     # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
     deepspeed_plugin = accelerator.state.deepspeed_plugin
     config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+
+    print("DEEPSPEED CONFIG", config_kwargs)
+
     stage = config_kwargs["zero_optimization"]["stage"]
 
     if model is not None:

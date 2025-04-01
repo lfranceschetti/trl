@@ -165,7 +165,8 @@ class VLLMClient:
                 Regular expression to guide the decoding process.
 
         Returns:
-            `list[list[dict]]`: List of cnversations, each containing a list of completions for each prompt.
+            `list[list[int]]`:
+                List of lists of token IDs representing the model-generated completions for each prompt.
         """
         url = f"http://{self.host}:{self.server_port}/generate/"
         response = self.session.post(
@@ -183,7 +184,7 @@ class VLLMClient:
             },
         )
         if response.status_code == 200:
-            return response.json()["conversations"]
+            return response.json()["completion_ids"]
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
@@ -203,22 +204,14 @@ class VLLMClient:
         self.rank = tensor_parallel_size  # The client's rank is the last process
 
         # Initialize weight update group
-        import socket
-        hostname = socket.gethostname()
-        print("HOSTNAME", hostname)
-
         url = f"http://{self.host}:{self.server_port}/init_communicator/"
         # In the server side, the host is set to 0.0.0.0
-        response = self.session.post(url, json={"host": hostname, "port": self.group_port, "world_size": world_size})
+        response = self.session.post(url, json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size})
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
         # Set up the communication group for weight broadcasting
-        print("Initializing communicator...")
-        print(f"Host: {hostname}, Port: {self.group_port}, Rank: {self.rank}, World size: {world_size}")
-        print(f"Self.Host: {self.host}, Self.Server_Port: {self.server_port}")
-
-        pg = StatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
+        pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
 
     def update_named_param(self, name: str, weights: torch.Tensor):

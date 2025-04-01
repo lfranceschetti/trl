@@ -78,7 +78,7 @@ class WeightSyncWorker(Worker):
     from a client process and distribute them to all worker processes participating in model inference.
     """
 
-    def __init__(*args, **kwargs):
+    def __init__(self, *args, **kwargs):
         if not is_vllm_available():
             raise ImportError(
                 "vLLM is required to use the WeightSyncWorker. Please install it using `pip install vllm`."
@@ -302,39 +302,6 @@ def main(script_args: ScriptArguments):
 
     app = FastAPI()
 
-    def tokenize_messages(messages, tokenizer):
-        """
-        Convert messages to token IDs and attention masks.
-        
-        Args:
-            messages: List of message dictionaries
-            tokenizer: Tokenizer to use
-            
-        Returns:
-            Tuple of (token_ids, attention_mask)
-        """
-        # Join all messages into a single string
-
-        MAX_LENGTH = 2048
-
-
-        token = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, padding='max_length', max_length=MAX_LENGTH)
-        mask = np.zeros(MAX_LENGTH).astype(int)
-
-        current_length = 0
-        for msg in messages:
-            msg_tokens = tokenizer.apply_chat_template([msg], tokenize=True, add_generation_prompt=False)
-            msg_length = len(msg_tokens)
-
-            if current_length + msg_length > MAX_LENGTH:
-                raise AssertionError(f"Message length exceeds max length: {current_length + msg_length} > {MAX_LENGTH}")
-
-            if msg["role"] == "assistant":
-                mask[current_length:current_length + msg_length] = 1
-
-            current_length += msg_length
-        
-        return token, mask
 
     # Define the endpoints for the model server
     @app.get("/health/")
@@ -396,10 +363,20 @@ def main(script_args: ScriptArguments):
             guided_decoding=request.guided_decoding_regex and 
                 GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
         )
+
+        swapped_convos = []
+        for convo in request.convos:
+            swapped_convo = []
+            for message in convo:
+                new_role = "user" if message["role"] == "assistant" else "assistant" if message["role"] == "user" else message["role"]
+                swapped_convo.append({"role": new_role, "content": message["content"]})
+            swapped_convos.append(swapped_convo)
+
+        print("Swapped convos:")
+        for convo in swapped_convos:
+            print(convo)
         
-        # Create formatted prompts using chat template
-      
-        formatted_conversations = [tokenizer.apply_chat_template([convo], tokenize=False, add_generation_prompt=True) for convo in request.convos]
+        formatted_conversations = [tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=True) for convo in swapped_convos]
 
         all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
         
@@ -407,6 +384,7 @@ def main(script_args: ScriptArguments):
         # Update conversation histories with this model's responses
         for i, output in enumerate(all_outputs):
             this_model_response = output.outputs[0].text
+            print(f"Response {i+1}: {this_model_response}")
             responses.append(this_model_response)
            
         return {"responses": responses}        

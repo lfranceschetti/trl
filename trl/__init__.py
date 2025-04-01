@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from .import_utils import OptionalDependencyNotAvailable, _LazyModule, is_diffusers_available
 
 
+
 _import_structure = {
     "scripts": ["init_zero_verbose", "ScriptArguments", "TrlParser"],
     "data_utils": [
