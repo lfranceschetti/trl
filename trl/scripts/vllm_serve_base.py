@@ -396,26 +396,56 @@ def main(script_args: ScriptArguments):
 
     class GenerateResponse(BaseModel):
         conversations: list[list[dict]]
+        token_ids: list[list[int]]
+        attention_masks: list[list[int]]
+        assistant_masks: list[list[int]]
+
+
 
     @app.post("/generate/", response_model=GenerateResponse)
     async def generate(request: GenerateRequest):
         """
-        Generates completions for the provided prompts using chat template formatting,
-        then sends them to a partner model, creating a back-and-forth conversation.
+        Generates completions and directly tracks token IDs and masks for efficiency.
         """
         import requests
         session = requests.Session()
         
-   
-        
-        # Initialize conversation histories for each prompt
+        # Initialize conversation histories and token tracking for each prompt
         conversations = []
-
+        all_token_ids = []
+        all_attention_masks = []
+        all_assistant_masks = []
+        max_length = 2048
+        
+        # Initialize with system prompts
         for prompt in request.prompts:
-            # Start with a system message containing the original prompt
             conversations.append([{"role": "system", "content": prompt}])
-            print({"role": "system", "content": prompt})
-
+            
+            # Tokenize the initial prompt
+            prompt_tokens = tokenizer.apply_chat_template(
+                [{"role": "system", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=False,
+                return_tensors="pt"
+            )
+            
+            # Initialize tensors for this conversation
+            token_ids = torch.full((1, max_length), tokenizer.pad_token_id, dtype=torch.long)
+            attention_mask = torch.zeros((1, max_length), dtype=torch.long)
+            assistant_mask = torch.zeros((1, max_length), dtype=torch.long)
+            
+            # Copy prompt tokens to the beginning
+            prompt_length = min(prompt_tokens.size(1), max_length)
+            token_ids[0, :prompt_length] = prompt_tokens[0, :prompt_length]
+            attention_mask[0, :prompt_length] = 1
+            
+            # Track current position
+            current_position = prompt_length
+            
+            all_token_ids.append(token_ids)
+            all_attention_masks.append(attention_mask)
+            all_assistant_masks.append(assistant_mask)
+        
         # Configure sampling parameters
         sampling_params = SamplingParams(
             n=request.n,
@@ -429,25 +459,30 @@ def main(script_args: ScriptArguments):
                 GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
         )
         
-        # Create formatted prompts using chat template
-      
-     
         for turn in range(script_args.conversation_turns):
-            # Generate responses for all conversations at once
-
+            # Generate responses for all conversations
             formatted_conversations = [tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True) for conversation in conversations]
-
             all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
             
-            # Update conversation histories with this model's responses
+            # Update conversations and token tracking
             for i, output in enumerate(all_outputs):
+                # Get the text response
                 this_model_response = output.outputs[0].text
                 conversations[i].append({"role": "assistant", "content": this_model_response})
-                print(conversations[i])
-
                 
+                # Get the token IDs directly from vLLM's output
+                assistant_tokens = torch.tensor(output.outputs[0].token_ids, dtype=torch.long).unsqueeze(0)
+                assistant_length = min(assistant_tokens.size(1), max_length - current_position)
+                
+                # Update token tracking
+                if assistant_length > 0:
+                    all_token_ids[i][0, current_position:current_position + assistant_length] = assistant_tokens[0, :assistant_length]
+                    all_attention_masks[i][0, current_position:current_position + assistant_length] = 1
+                    all_assistant_masks[i][0, current_position:current_position + assistant_length] = 1  # Mark as assistant tokens
+                    current_position += assistant_length
+            
             try:
-             
+                # Send conversations to partner model
                 partner_response = session.post(
                     f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
                     json={
@@ -465,19 +500,64 @@ def main(script_args: ScriptArguments):
                 
                 partner_data = partner_response.json()
                 
-                # Update all conversations with partner's responses
+                # Update conversations with partner's responses
                 for i, output in enumerate(partner_data["responses"]):
-                    # Add user response to conversation history
-                    conversations[i].append({"role": "user", "content": output})
-
+                    user_msg = {"role": "user", "content": output}
+                    conversations[i].append(user_msg)
+                    
+                    # Tokenize the user message
+                    user_tokens = tokenizer.apply_chat_template(
+                        [user_msg],
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        return_tensors="pt"
+                    )
+                    
+                    user_length = min(user_tokens.size(1), max_length - current_position)
+                    
+                    # Update token tracking
+                    if user_length > 0:
+                        all_token_ids[i][0, current_position:current_position + user_length] = user_tokens[0, :user_length]
+                        all_attention_masks[i][0, current_position:current_position + user_length] = 1
+                        # Don't mark as assistant tokens (assistant_mask remains 0)
+                        current_position += user_length
+                    
             except Exception as e:
                 logger.error(f"Error communicating with partner model: {e}")
-        
 
 
+        logger.info("Running sanity check on assistant masks...")
+        for i, conversation in enumerate(conversations):
+            try:
+                # Get just the assistant tokens by applying the mask
+                assistant_only_ids = all_token_ids[i].clone()
+                non_assistant_positions = all_assistant_masks[i] == 0
+                assistant_only_ids[non_assistant_positions] = tokenizer.pad_token_id
+                
+                # Remove padding tokens
+                valid_positions = all_attention_masks[i].bool() & all_assistant_masks[i].bool()
+                valid_tokens = assistant_only_ids[valid_positions]
+                
+                # Detokenize to get the text
+                assistant_text = tokenizer.decode(valid_tokens.tolist(), skip_special_tokens=True)
+                
+                # Extract expected assistant text from the conversation
+                expected_assistant_text = ' '.join([msg['content'] for msg in conversation if msg['role'] == 'assistant'])
+                
+                # Just print both for comparison
+                logger.info(f"Conversation {i} detokenized assistant text: '{assistant_text}'")
+                logger.info(f"Conversation {i} expected assistant text: '{expected_assistant_text}'")
+                    
+            except Exception as e:
+                logger.error(f"Error in sanity check for conversation {i}: {e}")
 
-        return {"conversations": conversations}
-
+        # Return both conversations and tokenized data
+        return {
+            "conversations": conversations,
+            "token_ids": [t[0].tolist() for t in all_token_ids],  # Note the [0] to get the first dimension
+            "attention_masks": [m[0].tolist() for m in all_attention_masks],
+            "assistant_masks": [m[0].tolist() for m in all_assistant_masks]
+        }
 
 
 

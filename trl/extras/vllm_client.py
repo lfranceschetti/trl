@@ -183,7 +183,13 @@ class VLLMClient:
             },
         )
         if response.status_code == 200:
-            return response.json()["conversations"]
+            data = response.json()
+            return {
+                "conversations": data["conversations"],
+                "token_ids": data["token_ids"],
+                "attention_masks": data["attention_masks"],
+                "assistant_masks": data["assistant_masks"]
+            }
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
