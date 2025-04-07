@@ -172,6 +172,7 @@ class VLLMClient:
             url,
             json={
                 "prompts": prompts,
+                "prompts_2": prompts_2,
                 "n": n,
                 "repetition_penalty": repetition_penalty,
                 "temperature": temperature,

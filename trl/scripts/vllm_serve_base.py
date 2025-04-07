@@ -222,7 +222,7 @@ class ScriptArguments:
     )
 
     conversation_turns : int = field(
-        default=3,
+        default=5,
         metadata={"help": "Number of turns in the conversation."},
     )
 
@@ -325,6 +325,59 @@ def main(script_args: ScriptArguments):
 
     app = FastAPI()
 
+    # Add memory management endpoints
+    @app.post("/clear_cache/")
+    async def clear_cache():
+        """
+        Clears the KV cache and prefix cache to free up memory.
+        """
+        try:
+            llm.llm_engine.reset_prefix_cache()
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            return {"status": "success", "message": "Cache cleared successfully"}
+        except Exception as e:
+            logger.error(f"Failed to clear cache: {e}")
+            return {"status": "error", "message": str(e)}
+
+    @app.get("/memory_status/")
+    async def memory_status():
+        """
+        Returns current memory usage statistics.
+        """
+        try:
+            memory_stats = {
+                "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,  # GB
+                "gpu_memory_cached": torch.cuda.memory_reserved() / 1024**3,  # GB
+                "gpu_memory_utilization": llm.llm_engine.gpu_memory_utilization,
+            }
+            return {"status": "success", "memory_stats": memory_stats}
+        except Exception as e:
+            logger.error(f"Failed to get memory status: {e}")
+            return {"status": "error", "message": str(e)}
+
+    # Add reconnection handling
+    @app.post("/reconnect/")
+    async def reconnect():
+        """
+        Attempts to reinitialize the model and communicator.
+        """
+        try:
+            # Close existing communicator if any
+            if hasattr(llm, 'collective_rpc'):
+                llm.collective_rpc("close_communicator")
+            
+            # Reinitialize the model
+            llm.llm_engine.reset()
+            
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            
+            return {"status": "success", "message": "Reconnected successfully"}
+        except Exception as e:
+            logger.error(f"Failed to reconnect: {e}")
+            return {"status": "error", "message": str(e)}
+
     def tokenize_messages(messages, tokenizer):
         """
         Convert messages to token IDs and attention masks.
@@ -338,7 +391,7 @@ def main(script_args: ScriptArguments):
         """
         # Join all messages into a single string
 
-        MAX_LENGTH = 2048
+        MAX_LENGTH = 4096
 
 
         token = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, padding='max_length', max_length=MAX_LENGTH)
@@ -385,6 +438,7 @@ def main(script_args: ScriptArguments):
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
+        prompts_2: list[str]
         n: int = 1
         repetition_penalty: float = 1.0
         temperature: float = 1.0
@@ -410,154 +464,188 @@ def main(script_args: ScriptArguments):
         import requests
         session = requests.Session()
         
-        # Initialize conversation histories and token tracking for each prompt
-        conversations = []
-        all_token_ids = []
-        all_attention_masks = []
-        all_assistant_masks = []
-        max_length = 2048
-        
-        # Initialize with system prompts
-        for prompt in request.prompts:
-            conversations.append([{"role": "system", "content": prompt}])
+        try:
+            # Check memory status before generation
+            memory_stats = await memory_status()
+            if memory_stats["status"] == "success":
+                allocated_gb = memory_stats["memory_stats"]["gpu_memory_allocated"]
+                if allocated_gb > 0.8 * llm.llm_engine.gpu_memory_utilization:  # If using more than 80% of allocated memory
+                    logger.warning(f"High memory usage detected ({allocated_gb:.2f} GB), clearing cache...")
+                    await clear_cache()
             
-            # Tokenize the initial prompt
-            prompt_tokens = tokenizer.apply_chat_template(
-                [{"role": "system", "content": prompt}],
-                tokenize=True,
-                add_generation_prompt=False,
-                return_tensors="pt"
-            )
+            # Initialize conversation histories and token tracking for each prompt
+            conversations = []
+            all_token_ids = []
+            all_attention_masks = []
+            all_assistant_masks = []
+            max_length = 4096
             
-            # Initialize tensors for this conversation
-            token_ids = torch.full((1, max_length), tokenizer.pad_token_id, dtype=torch.long)
-            attention_mask = torch.zeros((1, max_length), dtype=torch.long)
-            assistant_mask = torch.zeros((1, max_length), dtype=torch.long)
-            
-            # Copy prompt tokens to the beginning
-            prompt_length = min(prompt_tokens.size(1), max_length)
-            token_ids[0, :prompt_length] = prompt_tokens[0, :prompt_length]
-            attention_mask[0, :prompt_length] = 1
-            
-            # Track current position
-            current_position = prompt_length
-            
-            all_token_ids.append(token_ids)
-            all_attention_masks.append(attention_mask)
-            all_assistant_masks.append(assistant_mask)
-        
-        # Configure sampling parameters
-        sampling_params = SamplingParams(
-            n=request.n,
-            repetition_penalty=request.repetition_penalty,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            min_p=request.min_p,
-            max_tokens=request.max_tokens,
-            guided_decoding=request.guided_decoding_regex and 
-                GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
-        )
-        
-        for turn in range(script_args.conversation_turns):
-            # Generate responses for all conversations
-            formatted_conversations = [tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True) for conversation in conversations]
-            all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
-            
-            # Update conversations and token tracking
-            for i, output in enumerate(all_outputs):
-                # Get the text response
-                this_model_response = output.outputs[0].text
-                conversations[i].append({"role": "assistant", "content": this_model_response})
+            # Initialize with system prompts
+            for prompt in request.prompts:
+                conversations.append([{"role": "system", "content": prompt}])
                 
-                # Get the token IDs directly from vLLM's output
-                assistant_tokens = torch.tensor(output.outputs[0].token_ids, dtype=torch.long).unsqueeze(0)
-                assistant_length = min(assistant_tokens.size(1), max_length - current_position)
-                
-                # Update token tracking
-                if assistant_length > 0:
-                    all_token_ids[i][0, current_position:current_position + assistant_length] = assistant_tokens[0, :assistant_length]
-                    all_attention_masks[i][0, current_position:current_position + assistant_length] = 1
-                    all_assistant_masks[i][0, current_position:current_position + assistant_length] = 1  # Mark as assistant tokens
-                    current_position += assistant_length
-            
-            try:
-                # Send conversations to partner model
-                partner_response = session.post(
-                    f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
-                    json={
-                        "convos": conversations,
-                        "n": request.n,
-                        "repetition_penalty": request.repetition_penalty,
-                        "temperature": request.temperature,
-                        "top_p": request.top_p,
-                        "top_k": request.top_k,
-                        "min_p": request.min_p,
-                        "max_tokens": request.max_tokens,
-                        "guided_decoding_regex": request.guided_decoding_regex
-                    }
+                # Tokenize the initial prompt
+                prompt_tokens = tokenizer.apply_chat_template(
+                    [{"role": "system", "content": prompt}],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    return_tensors="pt"
                 )
                 
-                partner_data = partner_response.json()
+                # Initialize tensors for this conversation
+                token_ids = torch.full((1, max_length), tokenizer.pad_token_id, dtype=torch.long)
+                attention_mask = torch.zeros((1, max_length), dtype=torch.long)
+                assistant_mask = torch.zeros((1, max_length), dtype=torch.long)
                 
-                # Update conversations with partner's responses
-                for i, output in enumerate(partner_data["responses"]):
-                    user_msg = {"role": "user", "content": output}
-                    conversations[i].append(user_msg)
+                # Copy prompt tokens to the beginning
+                prompt_length = prompt_tokens.size(1)
+                token_ids[0, :prompt_length] = prompt_tokens[0, :prompt_length]
+                attention_mask[0, :prompt_length] = 1
+                
+                # Track current position
+                current_position = prompt_length
+                
+                all_token_ids.append(token_ids)
+                all_attention_masks.append(attention_mask)
+                all_assistant_masks.append(assistant_mask)
+            
+            # Configure sampling parameters
+            sampling_params = SamplingParams(
+                n=request.n,
+                repetition_penalty=request.repetition_penalty,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                min_p=request.min_p,
+                max_tokens=request.max_tokens,
+                guided_decoding=request.guided_decoding_regex and 
+                    GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
+            )
+            
+            for turn in range(script_args.conversation_turns):
+                try:
+                    # Generate responses for all conversations
+                    formatted_conversations = [tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True) for conversation in conversations]
+                    all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
                     
-                    # Tokenize the user message
-                    user_tokens = tokenizer.apply_chat_template(
-                        [user_msg],
-                        tokenize=True,
-                        add_generation_prompt=False,
-                        return_tensors="pt"
+                    # Update conversations and token tracking
+                    for i, output in enumerate(all_outputs):
+                        # Get the text response
+                        this_model_response = output.outputs[0].text
+                        conversations[i].append({"role": "assistant", "content": this_model_response})
+                        
+                        # Get the token IDs directly from vLLM's output
+                        assistant_tokens = torch.tensor(output.outputs[0].token_ids, dtype=torch.long).unsqueeze(0)
+                        assistant_length = min(assistant_tokens.size(1), max_length - current_position)
+                        
+                        # Update token tracking
+                        if assistant_length > 0:
+                            all_token_ids[i][0, current_position:current_position + assistant_length] = assistant_tokens[0, :assistant_length]
+                            all_attention_masks[i][0, current_position:current_position + assistant_length] = 1
+                            all_assistant_masks[i][0, current_position:current_position + assistant_length] = 1  # Mark as assistant tokens
+                            current_position += assistant_length
+                    
+                    # Clear cache periodically
+                    if turn % 5 == 0:  # Clear cache every 5 turns
+                        await clear_cache()
+                    
+                except Exception as e:
+                    logger.error(f"Error during generation at turn {turn}: {e}")
+                    # Attempt to reconnect and retry once
+                    try:
+                        await reconnect()
+                        # Retry the generation
+                        all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
+                    except Exception as retry_error:
+                        logger.error(f"Failed to recover after reconnection: {retry_error}")
+                        raise
+                
+                try:
+                    # Send conversations to partner model
+                    partner_response = session.post(
+                        f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
+                        json={
+                            "convos": conversations,
+                            "prompts_2": request.prompts_2,
+                            "n": request.n,
+                            "repetition_penalty": request.repetition_penalty,
+                            "temperature": request.temperature,
+                            "top_p": request.top_p,
+                            "top_k": request.top_k,
+                            "min_p": request.min_p,
+                            "max_tokens": request.max_tokens,
+                            "guided_decoding_regex": request.guided_decoding_regex
+                        }
                     )
                     
-                    user_length = min(user_tokens.size(1), max_length - current_position)
+                    partner_data = partner_response.json()
                     
-                    # Update token tracking
-                    if user_length > 0:
-                        all_token_ids[i][0, current_position:current_position + user_length] = user_tokens[0, :user_length]
-                        all_attention_masks[i][0, current_position:current_position + user_length] = 1
-                        # Don't mark as assistant tokens (assistant_mask remains 0)
-                        current_position += user_length
-                    
-            except Exception as e:
-                logger.error(f"Error communicating with partner model: {e}")
+                    # Update conversations with partner's responses
+                    for i, output in enumerate(partner_data["responses"]):
+                        user_msg = {"role": "user", "content": output}
+                        conversations[i].append(user_msg)
+                        
+                        # Tokenize the user message
+                        user_tokens = tokenizer.apply_chat_template(
+                            [user_msg],
+                            tokenize=True,
+                            add_generation_prompt=False,
+                            return_tensors="pt"
+                        )
+                        
+                        user_length = min(user_tokens.size(1), max_length - current_position)
+                        
+                        # Update token tracking
+                        if user_length > 0:
+                            all_token_ids[i][0, current_position:current_position + user_length] = user_tokens[0, :user_length]
+                            all_attention_masks[i][0, current_position:current_position + user_length] = 1
+                            # Don't mark as assistant tokens (assistant_mask remains 0)
+                            current_position += user_length
+                        
+                except Exception as e:
+                    logger.error(f"Error communicating with partner model: {e}")
+                    # Attempt to reconnect and retry once
+                    try:
+                        await reconnect()
+                        # Retry the partner communication
+                        partner_response = session.post(
+                            f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
+                            json={
+                                "convos": conversations,
+                                "n": request.n,
+                                "repetition_penalty": request.repetition_penalty,
+                                "temperature": request.temperature,
+                                "top_p": request.top_p,
+                                "top_k": request.top_k,
+                                "min_p": request.min_p,
+                                "max_tokens": request.max_tokens,
+                                "guided_decoding_regex": request.guided_decoding_regex
+                            }
+                        )
+                        partner_data = partner_response.json()
+                    except Exception as retry_error:
+                        logger.error(f"Failed to recover partner communication after reconnection: {retry_error}")
+                        raise
 
-
-        logger.info("Running sanity check on assistant masks...")
-        for i, conversation in enumerate(conversations):
+            # Final cleanup
+            await clear_cache()
+            
+            # Return both conversations and tokenized data
+            return {
+                "conversations": conversations,
+                "token_ids": [t[0].tolist() for t in all_token_ids],
+                "attention_masks": [m[0].tolist() for m in all_attention_masks],
+                "assistant_masks": [m[0].tolist() for m in all_assistant_masks]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in generate endpoint: {e}")
+            # Attempt to reconnect before raising the error
             try:
-                # Get just the assistant tokens by applying the mask
-                assistant_only_ids = all_token_ids[i].clone()
-                non_assistant_positions = all_assistant_masks[i] == 0
-                assistant_only_ids[non_assistant_positions] = tokenizer.pad_token_id
-                
-                # Remove padding tokens
-                valid_positions = all_attention_masks[i].bool() & all_assistant_masks[i].bool()
-                valid_tokens = assistant_only_ids[valid_positions]
-                
-                # Detokenize to get the text
-                assistant_text = tokenizer.decode(valid_tokens.tolist(), skip_special_tokens=True)
-                
-                # Extract expected assistant text from the conversation
-                expected_assistant_text = ' '.join([msg['content'] for msg in conversation if msg['role'] == 'assistant'])
-                
-                # Just print both for comparison
-                logger.info(f"Conversation {i} detokenized assistant text: '{assistant_text}'")
-                logger.info(f"Conversation {i} expected assistant text: '{expected_assistant_text}'")
-                    
-            except Exception as e:
-                logger.error(f"Error in sanity check for conversation {i}: {e}")
-
-        # Return both conversations and tokenized data
-        return {
-            "conversations": conversations,
-            "token_ids": [t[0].tolist() for t in all_token_ids],  # Note the [0] to get the first dimension
-            "attention_masks": [m[0].tolist() for m in all_attention_masks],
-            "assistant_masks": [m[0].tolist() for m in all_assistant_masks]
-        }
+                await reconnect()
+            except Exception as reconnect_error:
+                logger.error(f"Failed to reconnect after error: {reconnect_error}")
+            raise
 
 
 

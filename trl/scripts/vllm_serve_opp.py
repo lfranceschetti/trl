@@ -329,6 +329,7 @@ def main(script_args: ScriptArguments):
 
     class GenerateRequest(BaseModel):
         convos: list[list[dict[str, str]]]
+        prompts_2: list[str]
         n: int = 1
         repetition_penalty: float = 1.0
         temperature: float = 1.0
@@ -365,11 +366,16 @@ def main(script_args: ScriptArguments):
         )
 
         swapped_convos = []
-        for convo in request.convos:
+        for i, convo in enumerate(request.convos):
             swapped_convo = []
             for message in convo:
-                new_role = "user" if message["role"] == "assistant" else "assistant" if message["role"] == "user" else message["role"]
-                swapped_convo.append({"role": new_role, "content": message["content"]})
+                if message["role"] == "system":
+                    swapped_convo.append({"role": message["role"], "content": request.prompts_2[i]})
+                elif message["role"] == "user":
+                    swapped_convo.append({"role": "assistant", "content": message["content"]})
+                else:
+                    swapped_convo.append({"role": "user", "content": message["content"]})
+
             swapped_convos.append(swapped_convo)
 
         print("Swapped convos:")
