@@ -132,6 +132,7 @@ class VLLMClient:
     def generate(
         self,
         prompts: list[str],
+        prompts_2: list[str] = None,
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,

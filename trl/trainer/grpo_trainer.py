@@ -56,6 +56,9 @@ from .utils import (
     selective_log_softmax,
 )
 
+import logging
+import copy
+import gc
 
 if is_deepspeed_available():
     import deepspeed
@@ -625,31 +628,54 @@ class GRPOTrainer(Trainer):
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         gather_if_zero3 = deepspeed.zero.GatheredParameters if zero_stage_3 else nullcontext
 
+    
         if is_peft_model(self.model):
             # With PEFT and DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as merging
             # adapters in a sharded manner is not supported.
+            logger = logging.getLogger(__name__)
+            logger.info("Merging adapters")
+           
             with gather_if_zero3(list(self.model.parameters())):
-                self.model.merge_adapter()
+                
+                merged_model = copy.deepcopy(self.model).merge_and_unload()
+                state_dict = merged_model.state_dict()
 
-                # Update vLLM weights while parameters are gathered
-                for name, param in self.model.named_parameters():
-                    # When using PEFT, we need to recover the original parameter name and discard some parameters
-                    name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                    if self.model.prefix in name:
-                        continue
-                    # When module to save, remove its prefix and discard the original module
-                    if "original_module" in name:
-                        continue
-                    name = name.replace("modules_to_save.default.", "")
+                # unwrapped_model.merge_adapter()
+                
+                # # Get state dict from unwrapped model
+                # state_dict = unwrapped_model.state_dict()
+                # # Clean up parameter names
+                # state_dict = {
+                #     k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
+                # }
+                # # Remove values with adapter prefix (example: "_lora")
+                # state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
+                # # When module to save, remove its prefix and discard the original module
+                # state_dict = {
+                #     k.replace("modules_to_save.default.", ""): v
+                #     for k, v in state_dict.items()
+                #     if "original_module" not in k
+                # }
+                
+                if self.accelerator.is_main_process:
+                    for name, param in state_dict.items():
+                        name = name.replace("modules_to_save.default.", "")
+                        logger.info(f"Updating parameter {name} with shape {param.shape} and dtype {param.dtype}")
+                        self.vllm_client.update_named_param(name, param)
 
-                    if self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
+                #Free memory
+                del state_dict
+                del merged_model
+                torch.cuda.empty_cache()
+                gc.collect()
+
 
                 # Unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
+                # self.model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather and update each parameter individually.
+
             for name, param in self.model.named_parameters():
                 with gather_if_zero3([param]):
                     if self.accelerator.is_main_process:
