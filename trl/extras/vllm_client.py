@@ -232,6 +232,7 @@ class VLLMClient:
     def update_named_param(self, name: str, weights: torch.Tensor):
         """
         Updates a specific named parameter in the model and broadcasts it to other processes.
+        Will retry on failure and attempt to reinitialize the communicator.
 
         Args:
             name (`str`):
@@ -239,15 +240,39 @@ class VLLMClient:
             weights (`torch.Tensor`):
                 Tensor containing the updated weights.
         """
-        dtype, shape = str(weights.dtype), tuple(weights.shape)
-        url = f"http://{self.host}:{self.server_port}/update_named_param/"
-        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                dtype, shape = str(weights.dtype), tuple(weights.shape)
+                url = f"http://{self.host}:{self.server_port}/update_named_param/"
+                response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
+                if response.status_code != 200:
+                    raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
-        # Broadcast the weights to the other processes
-        self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
-        self.pynccl_comm.group.barrier()
+                # Broadcast the weights to the other processes
+                if self.pynccl_comm is None:
+                    logger.warning(f"Communicator not initialized for {name}, attempting to reinitialize...")
+                    self.init_communicator()
+                    
+                self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
+                self.pynccl_comm.group.barrier()
+                return  # Success
+                
+            except Exception as e:
+                logger.error(f"Error updating parameter {name} (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    # Try to reinitialize communicator
+                    try:
+                        self.close_communicator()
+                        self.init_communicator()
+                    except Exception as init_error:
+                        logger.error(f"Failed to reinitialize communicator: {str(init_error)}")
+                else:
+                    raise Exception(f"Failed to update parameter {name} after {max_retries} attempts") from e
 
     def update_model_params(self, model: nn.Module):
         """
