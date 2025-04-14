@@ -30,7 +30,7 @@ if is_requests_available():
 
 if is_vllm_available():
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup
+    from ..extras.stateless_group import CustomStatelessProcessGroup
 
 
 logger = logging.getLogger(__name__)
@@ -226,7 +226,7 @@ class VLLMClient:
         print(f"Host: {hostname}, Port: {self.group_port}, Rank: {self.rank}, World size: {world_size}")
         print(f"Self.Host: {self.host}, Self.Server_Port: {self.server_port}")
 
-        pg = StatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
+        pg = CustomStatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
 
     def update_named_param(self, name: str, weights: torch.Tensor):

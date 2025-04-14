@@ -60,7 +60,7 @@ if is_vllm_available() and libcuda_available:
     from vllm import LLM, SamplingParams
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.parallel_state import get_world_group
-    from vllm.distributed.utils import StatelessProcessGroup
+    from trl.extras.stateless_group import CustomStatelessProcessGroup
     from vllm.sampling_params import GuidedDecodingParams
     from vllm.worker.worker import Worker
 else:
@@ -129,7 +129,7 @@ class WeightSyncWorker(Worker):
         rank = get_world_group().rank
 
         # Create a stateless process group to manage communication between training processes and vLLM workers.
-        pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
+        pg = CustomStatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
 
         # Initialize the NCCL-based communicator for weight synchronization.
         self.pynccl_comm = PyNcclCommunicator(pg, device=self.device)
@@ -766,7 +766,7 @@ def main(script_args: ScriptArguments):
         shape: list[int]
 
     @app.post("/update_named_param/")
-    async def update_named_param(request: UpdateWeightsRequest):
+    async def update_named_param(request: UpdateWeightsRequest, background_tasks: BackgroundTasks):
         """
         Updates the model weights with the provided tensor.
         Uses a queue system to ensure parameters are processed in order.
@@ -788,13 +788,8 @@ def main(script_args: ScriptArguments):
         # Parse dtype
         dtype = torch.__getattribute__(request.dtype.split(".")[-1])
         
-        # Add to queue and process synchronously
-        async with queue_lock:
-            param_update_queue.append((request.name, dtype, request.shape, sequence_num))
-            
-            # Start the queue processor if it's not already running
-            if not update_in_progress:
-                asyncio.create_task(process_param_update_queue(llm))
+        background_tasks.add_task(llm.collective_rpc, "update_named_param", args=(request.name, dtype, request.shape, sequence_num))
+
         
         return {"message": f"Request #{sequence_num} queued for param {request.name}"}
 
