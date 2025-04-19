@@ -152,29 +152,19 @@ class WeightSyncWorker(Worker):
             raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
 
         try:
-            logger.info(f"SEQUENCE: Starting update #{sequence_num} for param {name}")
 
             size_mb = np.prod(shape) * torch.tensor([], dtype=dtype).element_size() / (1024**2)
             free_memory = torch.cuda.get_device_properties(self.device).total_memory - torch.cuda.memory_allocated(self.device)
             free_memory_gb = free_memory / (1024**3)
-            logger.info(f"Allocating tensor of shape {shape}, size {size_mb:.2f} MB, free memory: {free_memory_gb:.2f} GB")
-
-            logger.info(f"SEQUENCE: Allocating memory for update #{sequence_num}")
 
             # Allocate memory for the incoming weight tensor on the correct device.
             weight = torch.empty(shape, dtype=dtype, device=self.device)
 
-            logger.info(f"SEQUENCE: Entering broadcast for update #{sequence_num}")
-
             # Use NCCL to broadcast the updated weights from the client (src) to all workers.
             self.pynccl_comm.broadcast(weight, src=self.client_rank, stream=torch.cuda.current_stream())
             
-            logger.info(f"SEQUENCE: Entering barrier for update #{sequence_num}")
-            
             # Use a timeout to prevent indefinite hangs
             self.pynccl_comm.group.barrier()
-
-            logger.info(f"SEQUENCE: Entering load_weights for update #{sequence_num}")
 
             # Update the model weights
             self.model_runner.model.load_weights(weights=[(name, weight)])

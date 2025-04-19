@@ -629,34 +629,63 @@ class GRPOTrainer(Trainer):
         gather_if_zero3 = deepspeed.zero.GatheredParameters if zero_stage_3 else nullcontext
 
         if is_peft_model(self.model):
+            torch.cuda.empty_cache()
+            with torch.no_grad():
             # With PEFT and DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as merging
             # adapters in a sharded manner is not supported.
-            with gather_if_zero3(list(self.model.parameters())):
-                self.model.merge_adapter()
+                with gather_if_zero3(list(self.model.parameters())):
 
-                # Update vLLM weights while parameters are gathered
-                for name, param in self.model.named_parameters():
-                    name = name.removeprefix("base_model.model.").replace("base_layer.", "")
 
-                    if self.model.prefix in name:
-                        continue
-                    # When module to save, remove its prefix and discard the original module
-                    if "original_module" in name:
-                        continue
+                    # # Make it:
+                    # temp_model = copy.deepcopy(self.model).merge_and_unload()
+                    # state_dict = temp_model.state_dict()
+
+                    # for name, param in self.model.named_parameters():
+                    #     name = name.removeprefix("base_model.model.").replace("base_layer.", "")
+                    #     if self.model.prefix in name:
+                    #         continue
+                    #     if "original_module" in name:
+                    #         continue
+                    #     name = name.replace("lora_A.default.", "")
+                    #     name = name.replace("lora_B.default.", "")
+                    #     name = name.replace("modules_to_save.default.", "")
+
+                    #     if self.accelerator.is_main_process:
+                    #         self.vllm_client.update_named_param(name, param.data)
+
+                    # #free memory
+                    # del temp_model  # Delete the temporary model copy
+                    # del state_dict
+                    # gc.collect()
+
+                    # torch.cuda.empty_cache()
+
+
+                    self.model.merge_adapter()
+
+                    # Update vLLM weights while parameters are gathered
+                    for name, param in self.model.named_parameters():
+                        name = name.removeprefix("base_model.model.").replace("base_layer.", "")
+
+                        if self.model.prefix in name:
+                            continue
+                        # When module to save, remove its prefix and discard the original module
+                        if "original_module" in name:
+                            continue
+                            
+                        name = name.replace("lora_A.default.", "")
+                        name = name.replace("lora_B.default.", "")
+                        name = name.replace("modules_to_save.default.", "")
+
                         
-                    name = name.replace("lora_A.default.", "")
-                    name = name.replace("lora_B.default.", "")
-                    name = name.replace("modules_to_save.default.", "")
-
+                        if self.accelerator.is_main_process:
+                            self.vllm_client.update_named_param(name, param.data)
                     
-                    if self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
-                
-                # Make sure all processes wait for main process to finish sending weights
-                self.accelerator.wait_for_everyone()
+                    # Make sure all processes wait for main process to finish sending weights
+                    self.accelerator.wait_for_everyone()
 
-                # Now safe to unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
+                    # Now safe to unmerge adapters while parameters are still gathered
+                    self.model.unmerge_adapter()
         else:
             # For non-PEFT models, simply gather and update each parameter individually.
             for name, param in self.model.named_parameters():

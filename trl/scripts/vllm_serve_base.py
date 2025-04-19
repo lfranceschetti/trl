@@ -155,29 +155,19 @@ class WeightSyncWorker(Worker):
             raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
 
         try:
-            logger.info(f"SEQUENCE: Starting update #{sequence_num} for param {name}")
 
             size_mb = np.prod(shape) * torch.tensor([], dtype=dtype).element_size() / (1024**2)
             free_memory = torch.cuda.get_device_properties(self.device).total_memory - torch.cuda.memory_allocated(self.device)
             free_memory_gb = free_memory / (1024**3)
-            logger.info(f"Allocating tensor of shape {shape}, size {size_mb:.2f} MB, free memory: {free_memory_gb:.2f} GB")
-
-            logger.info(f"SEQUENCE: Allocating memory for update #{sequence_num}")
 
             # Allocate memory for the incoming weight tensor on the correct device.
             weight = torch.empty(shape, dtype=dtype, device=self.device)
 
-            logger.info(f"SEQUENCE: Entering broadcast for update #{sequence_num}")
-
             # Use NCCL to broadcast the updated weights from the client (src) to all workers.
             self.pynccl_comm.broadcast(weight, src=self.client_rank, stream=torch.cuda.current_stream())
             
-            logger.info(f"SEQUENCE: Entering barrier for update #{sequence_num}")
-            
             # Use a timeout to prevent indefinite hangs
             self.pynccl_comm.group.barrier()
-
-            logger.info(f"SEQUENCE: Entering load_weights for update #{sequence_num}")
 
             # Update the model weights
             self.model_runner.model.load_weights(weights=[(name, weight)])
@@ -268,6 +258,11 @@ class ScriptArguments:
         metadata={"help": "Number of turns in the conversation."},
     )
 
+    starting_agent: bool = field(
+        default=True,
+        metadata={"help": "Whether this agent should start the conversation. If False, the partner agent will start."},
+    )
+
     partner_host: str = field(
         default="0.0.0.0",
         metadata={"help": "Host address to run the partner on"},
@@ -283,6 +278,13 @@ class ScriptArguments:
             "cache on the device dedicated to generation powered by vLLM. Higher values will increase the KV cache "
             "size and thus improve the model's throughput. However, if the value is too high, it may cause "
             "out-of-memory (OOM) errors during initialization."
+        },
+    )
+    quantization: str = field(
+        default=None,
+        metadata={
+            "help": "Quantization to use for vLLM generation. If set to 'auto', the quantization will be automatically "
+            "determined based on the model configuration. Find the supported values in the vLLM documentation."
         },
     )
     dtype: str = field(
@@ -307,49 +309,6 @@ class ScriptArguments:
             "hardware support this feature."
         },
     )
-
-async def process_param_update_queue(llm):
-    """
-    Process parameter updates from the queue in strict order.
-    """
-    global update_in_progress
-    
-    async with queue_lock:
-        update_in_progress = True
-    
-    try:
-        while True:
-            # Check if queue is empty
-            async with queue_lock:
-                if not param_update_queue:
-                    update_in_progress = False
-                    break
-                
-                # Get next update from queue (but don't remove it yet)
-                name, dtype, shape, sequence_num = param_update_queue[0]
-            
-            logger.info(f"SEQUENCE: Processing queued update #{sequence_num} for param {name}")
-            
-            try:
-                # Process update synchronously
-                result = llm.collective_rpc("update_named_param", args=(name, dtype, shape, sequence_num))
-                
-                # Only remove from queue after successful completion
-                async with queue_lock:
-                    param_update_queue.popleft()
-                
-                logger.info(f"SEQUENCE: Successfully completed update #{sequence_num} for param {name}")
-                
-            except Exception as e:
-                logger.error(f"Error processing update #{sequence_num} for {name}: {e}")
-                # Remove the failed update to prevent blocking the queue
-                async with queue_lock:
-                    param_update_queue.popleft()
-    
-    except Exception as e:
-        logger.error(f"Error in queue processor: {e}")
-        async with queue_lock:
-            update_in_progress = False
 
 
 def main(script_args: ScriptArguments):
@@ -434,7 +393,6 @@ def main(script_args: ScriptArguments):
             memory_stats = {
                 "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,  # GB
                 "gpu_memory_cached": torch.cuda.memory_reserved() / 1024**3,  # GB
-                "gpu_memory_utilization": llm.llm_engine.gpu_memory_utilization,
             }
             return {"status": "success", "memory_stats": memory_stats}
         except Exception as e:
@@ -472,30 +430,43 @@ def main(script_args: ScriptArguments):
             tokenizer: Tokenizer to use
             
         Returns:
-            Tuple of (token_ids, attention_mask)
+            Tuple of (token_ids, attention_mask, assistant_mask)
         """
-        # Join all messages into a single string
-
         MAX_LENGTH = 4096
-
-
-        token = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, padding='max_length', max_length=MAX_LENGTH)
-        mask = np.zeros(MAX_LENGTH).astype(int)
-
-        current_length = 0
-        for msg in messages:
-            msg_tokens = tokenizer.apply_chat_template([msg], tokenize=True, add_generation_prompt=False)
-            msg_length = len(msg_tokens)
-
-            if current_length + msg_length > MAX_LENGTH:
-                raise AssertionError(f"Message length exceeds max length: {current_length + msg_length} > {MAX_LENGTH}")
-
-            if msg["role"] == "assistant":
-                mask[current_length:current_length + msg_length] = 1
-
-            current_length += msg_length
         
-        return token, mask
+        # Apply chat template to get the full tokenized conversation
+        tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+        
+        # Create properly sized tensors
+        token_ids = torch.full((MAX_LENGTH,), tokenizer.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((MAX_LENGTH,), dtype=torch.long)
+        assistant_mask = torch.zeros((MAX_LENGTH,), dtype=torch.long)
+
+        # Fill tensors with actual content up to min(tokens.size(1), MAX_LENGTH)
+        length = min(len(tokens), MAX_LENGTH)
+        token_ids[:length] = torch.tensor(tokens[:length])
+        attention_mask[:length] = 1
+        
+        # Define the start and end sequences
+        start_sequence = [128006, 78191, 128007, 271]
+        end_token = 128009
+
+        # Find all start and end positions
+        i = 0
+        while i < length - len(start_sequence) + 1:
+            if token_ids[i:i+len(start_sequence)].tolist() == start_sequence:
+                start_pos = i
+                # Find the end position for this start
+                for j in range(start_pos + len(start_sequence), length):
+                    if token_ids[j] == end_token:
+                        end_pos = j + 1  # Include the end token
+                        # Update the assistant mask for this occurrence
+                        assistant_mask[start_pos:end_pos] = 1
+                        i = end_pos  # Move i to the end of this occurrence
+                        break
+            i += 1
+
+        return token_ids, attention_mask, assistant_mask
 
     # Define the endpoints for the model server
     @app.get("/health/")
@@ -504,6 +475,55 @@ def main(script_args: ScriptArguments):
         Health check endpoint to verify that the server is running.
         """
         return {"status": "ok"}
+
+    async def interact_with_partner(session, conversations, request, script_args):
+        """
+        Separate function to handle interaction with the partner model.
+        
+        Returns:
+            user_messages: List of user messages from the partner model
+            user_tokens_list: List of token tensors from the partner model
+        """
+
+        partner_response = session.post(
+            f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
+            json={
+                "convos": conversations,
+                "prompts_2": request.prompts_2,
+                "n": request.n,
+                "repetition_penalty": request.repetition_penalty,
+                "temperature": request.temperature,
+                "top_p": request.top_p,
+                "top_k": request.top_k,
+                "min_p": request.min_p,
+                "max_tokens": request.max_tokens,
+                "guided_decoding_regex": request.guided_decoding_regex
+            }
+        )
+        
+        partner_data = partner_response.json()
+        
+        user_messages = []
+        user_tokens_list = []
+        
+        # Update conversations with partner's responses
+        for i, output in enumerate(partner_data["responses"]):
+            user_msg = {"role": "user", "content": output}
+            user_messages.append(user_msg)
+            
+            # Tokenize the user message
+            user_tokens = tokenizer.apply_chat_template(
+                [user_msg],
+                tokenize=True,
+                add_generation_prompt=False,
+                return_tensors="pt"
+            )
+            user_tokens_list.append(user_tokens)
+        
+        return user_messages, user_tokens_list
+
+                
+    
 
     @app.get("/get_tensor_parallel_size/")
     async def get_tensor_parallel_size():
@@ -532,6 +552,7 @@ def main(script_args: ScriptArguments):
         min_p: float = 0.0
         max_tokens: int = 16
         guided_decoding_regex: Optional[str] = None
+        starting_agent: Optional[bool] = None  # Override the script argument if provided
 
     class GenerateResponse(BaseModel):
         conversations: list[list[dict]]
@@ -552,11 +573,9 @@ def main(script_args: ScriptArguments):
         try:
             # Check memory status before generation
             memory_stats = await memory_status()
-            if memory_stats["status"] == "success":
-                allocated_gb = memory_stats["memory_stats"]["gpu_memory_allocated"]
-                if allocated_gb > 0.8 * llm.llm_engine.gpu_memory_utilization:  # If using more than 80% of allocated memory
-                    logger.warning(f"High memory usage detected ({allocated_gb:.2f} GB), clearing cache...")
-                    await clear_cache()
+            logger.info(f"Memory status: {memory_stats}")
+                
+               
             
             # Initialize conversation histories and token tracking for each prompt
             conversations = []
@@ -565,34 +584,15 @@ def main(script_args: ScriptArguments):
             all_assistant_masks = []
             max_length = 4096
             
+            # Determine which agent starts the conversation
+            starting_agent = request.starting_agent if request.starting_agent is not None else script_args.starting_agent
+            logger.info(f"Starting agent: {starting_agent}. True means current model starts, False means partner model starts.")
+            
             # Initialize with system prompts
             for prompt in request.prompts:
                 conversations.append([{"role": "system", "content": prompt}])
                 
                 # Tokenize the initial prompt
-                prompt_tokens = tokenizer.apply_chat_template(
-                    [{"role": "system", "content": prompt}],
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    return_tensors="pt"
-                )
-                
-                # Initialize tensors for this conversation
-                token_ids = torch.full((1, max_length), tokenizer.pad_token_id, dtype=torch.long)
-                attention_mask = torch.zeros((1, max_length), dtype=torch.long)
-                assistant_mask = torch.zeros((1, max_length), dtype=torch.long)
-                
-                # Copy prompt tokens to the beginning
-                prompt_length = prompt_tokens.size(1)
-                token_ids[0, :prompt_length] = prompt_tokens[0, :prompt_length]
-                attention_mask[0, :prompt_length] = 1
-                
-                # Track current position
-                current_position = prompt_length
-                
-                all_token_ids.append(token_ids)
-                all_attention_masks.append(attention_mask)
-                all_assistant_masks.append(assistant_mask)
             
             # Configure sampling parameters
             sampling_params = SamplingParams(
@@ -609,6 +609,18 @@ def main(script_args: ScriptArguments):
             
             for turn in range(script_args.conversation_turns):
                 try:
+                    # If starting_agent is False and this is the first turn, let the partner go first
+                    if not starting_agent and turn == 0:
+                        # Partner model goes first
+                        logger.info(f"Turn {turn}: Partner model starts the conversation (starting_agent=False)")
+                        user_messages, user_tokens_list = await interact_with_partner(session, conversations, request, script_args)
+                        
+                        # Update all conversations with user messages
+                        for i in range(len(conversations)):
+                            if i < len(user_messages):
+                                conversations[i].append(user_messages[i])
+                                
+                    
                     # Generate responses for all conversations
                     formatted_conversations = [tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True) for conversation in conversations]
                     all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
@@ -619,98 +631,53 @@ def main(script_args: ScriptArguments):
                         this_model_response = output.outputs[0].text
                         conversations[i].append({"role": "assistant", "content": this_model_response})
                         
-                        # Get the token IDs directly from vLLM's output
-                        assistant_tokens = torch.tensor(output.outputs[0].token_ids, dtype=torch.long).unsqueeze(0)
-                        assistant_length = min(assistant_tokens.size(1), max_length - current_position)
-                        
-                        # Update token tracking
-                        if assistant_length > 0:
-                            all_token_ids[i][0, current_position:current_position + assistant_length] = assistant_tokens[0, :assistant_length]
-                            all_attention_masks[i][0, current_position:current_position + assistant_length] = 1
-                            all_assistant_masks[i][0, current_position:current_position + assistant_length] = 1  # Mark as assistant tokens
-                            current_position += assistant_length
+               
                     
                     # Clear cache periodically
                     if turn % 5 == 0:  # Clear cache every 5 turns
                         await clear_cache()
-                    
+
+                    if turn == script_args.conversation_turns - 1 and not starting_agent:
+                        pass
+                    else:
+                        logger.info(f"Turn {turn}: Getting response from partner model")
+                        user_messages, user_tokens_list = await interact_with_partner(
+                            session, conversations, request, script_args)
+                        
+                        # Update all conversations with user messages
+                        for i in range(len(conversations)):
+                            if i < len(user_messages):
+                                conversations[i].append(user_messages[i])
+                       
                 except Exception as e:
                     logger.error(f"Error during generation at turn {turn}: {e}")
                     # Attempt to reconnect and retry once
-                    try:
-                        await reconnect()
-                        # Retry the generation
-                        all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
-                    except Exception as retry_error:
-                        logger.error(f"Failed to recover after reconnection: {retry_error}")
-                        raise
+           
+            
+            for convo in conversations:
+                token_ids, attention_mask, assistant_mask = tokenize_messages(convo, tokenizer)
+                all_token_ids.append(token_ids)
+                all_attention_masks.append(attention_mask)
+                all_assistant_masks.append(assistant_mask)
+
+
+            #Show decoded assistant responses
+            for i, output in enumerate(conversations):
+                for j, msg in enumerate(output):
+                    print(f"Response {i+1}: {msg['content']}")
+
+                token = all_token_ids[i]
+                attention_mask = all_attention_masks[i]
+                assistant_mask = all_assistant_masks[i]
+
+                applied_mask = assistant_mask * token
+
+                print(f"Applied mask: {applied_mask.tolist()}")
+                # Decode the token ids
+                decoded_tokens = tokenizer.decode(applied_mask)
+                print(f"Decoded tokens: {decoded_tokens}")
+
                 
-                try:
-                    # Send conversations to partner model
-                    partner_response = session.post(
-                        f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
-                        json={
-                            "convos": conversations,
-                            "prompts_2": request.prompts_2,
-                            "n": request.n,
-                            "repetition_penalty": request.repetition_penalty,
-                            "temperature": request.temperature,
-                            "top_p": request.top_p,
-                            "top_k": request.top_k,
-                            "min_p": request.min_p,
-                            "max_tokens": request.max_tokens,
-                            "guided_decoding_regex": request.guided_decoding_regex
-                        }
-                    )
-                    
-                    partner_data = partner_response.json()
-                    
-                    # Update conversations with partner's responses
-                    for i, output in enumerate(partner_data["responses"]):
-                        user_msg = {"role": "user", "content": output}
-                        conversations[i].append(user_msg)
-                        
-                        # Tokenize the user message
-                        user_tokens = tokenizer.apply_chat_template(
-                            [user_msg],
-                            tokenize=True,
-                            add_generation_prompt=False,
-                            return_tensors="pt"
-                        )
-                        
-                        user_length = min(user_tokens.size(1), max_length - current_position)
-                        
-                        # Update token tracking
-                        if user_length > 0:
-                            all_token_ids[i][0, current_position:current_position + user_length] = user_tokens[0, :user_length]
-                            all_attention_masks[i][0, current_position:current_position + user_length] = 1
-                            # Don't mark as assistant tokens (assistant_mask remains 0)
-                            current_position += user_length
-                        
-                except Exception as e:
-                    logger.error(f"Error communicating with partner model: {e}")
-                    # Attempt to reconnect and retry once
-                    try:
-                        await reconnect()
-                        # Retry the partner communication
-                        partner_response = session.post(
-                            f"http://{script_args.partner_host}:{script_args.partner_port}/generate/",
-                            json={
-                                "convos": conversations,
-                                "n": request.n,
-                                "repetition_penalty": request.repetition_penalty,
-                                "temperature": request.temperature,
-                                "top_p": request.top_p,
-                                "top_k": request.top_k,
-                                "min_p": request.min_p,
-                                "max_tokens": request.max_tokens,
-                                "guided_decoding_regex": request.guided_decoding_regex
-                            }
-                        )
-                        partner_data = partner_response.json()
-                    except Exception as retry_error:
-                        logger.error(f"Failed to recover partner communication after reconnection: {retry_error}")
-                        raise
 
             # Final cleanup
             await clear_cache()
@@ -718,9 +685,9 @@ def main(script_args: ScriptArguments):
             # Return both conversations and tokenized data
             return {
                 "conversations": conversations,
-                "token_ids": [t[0].tolist() for t in all_token_ids],
-                "attention_masks": [m[0].tolist() for m in all_attention_masks],
-                "assistant_masks": [m[0].tolist() for m in all_assistant_masks]
+                "token_ids": [t.tolist() for t in all_token_ids],
+                "attention_masks": [m.tolist() for m in all_attention_masks],
+                "assistant_masks": [m.tolist() for m in all_assistant_masks]
             }
             
         except Exception as e:

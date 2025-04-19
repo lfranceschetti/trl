@@ -231,6 +231,13 @@ class ScriptArguments:
             "out-of-memory (OOM) errors during initialization."
         },
     )
+    quantization: str = field(
+        default=None,
+        metadata={
+            "help": "Quantization to use for vLLM generation. If set to 'auto', the quantization will be automatically "
+            "determined based on the model configuration. Find the supported values in the vLLM documentation."
+        },
+    )
     dtype: str = field(
         default="auto",
         metadata={
@@ -246,6 +253,7 @@ class ScriptArguments:
             "context size, which might be much larger than the KV cache, leading to inefficiencies."
         },
     )
+
     enable_prefix_caching: Optional[bool] = field(
         default=None,
         metadata={
@@ -273,6 +281,8 @@ def main(script_args: ScriptArguments):
 
     if not is_vllm_available():
         raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
+
+    print("Quantization:", script_args.quantization)
 
     llm = LLM(
         model=script_args.model,
