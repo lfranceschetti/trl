@@ -169,7 +169,6 @@ class WeightSyncWorker(Worker):
             # Update the model weights
             self.model_runner.model.load_weights(weights=[(name, weight)])
             
-            logger.info(f"SEQUENCE: Completed update #{sequence_num} for param {name}")
             return True
             
         except Exception as e:
@@ -489,8 +488,6 @@ def main(script_args: ScriptArguments):
         global update_sequence_counter, update_in_progress
         update_sequence_counter += 1
         sequence_num = update_sequence_counter
-        
-        logger.info(f"SEQUENCE: Received HTTP request #{sequence_num} for param {request.name}")
         
         # Parse dtype
         dtype = torch.__getattribute__(request.dtype.split(".")[-1])

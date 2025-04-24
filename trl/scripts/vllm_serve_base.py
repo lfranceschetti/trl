@@ -20,7 +20,9 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline  
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from vllm.lora.request import LoRARequest
+from huggingface_hub import snapshot_download
 
 
 
@@ -172,7 +174,6 @@ class WeightSyncWorker(Worker):
             # Update the model weights
             self.model_runner.model.load_weights(weights=[(name, weight)])
             
-            logger.info(f"SEQUENCE: Completed update #{sequence_num} for param {name}")
             return True
             
         except Exception as e:
@@ -271,6 +272,11 @@ class ScriptArguments:
         default=8001,
         metadata={"help": "Host address to run the partner on"},
     )
+
+    adapter: str = field(
+        default=None,
+        metadata={"help": "Adapter to use for the model."},
+    )
     gpu_memory_utilization: float = field(
         default=0.9,
         metadata={
@@ -301,7 +307,13 @@ class ScriptArguments:
             "`vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model "
             "context size, which might be much larger than the KV cache, leading to inefficiencies."
         },
-    )
+    ),
+    enable_weight_sync: Optional[bool] = field(
+        default=True,
+        metadata={
+            "help": "Whether to enable weight synchronization between the server and the partner."
+        },
+    ),
     enable_prefix_caching: Optional[bool] = field(
         default=None,
         metadata={
@@ -336,22 +348,37 @@ def main(script_args: ScriptArguments):
 
     logger.info(f"Loading model: {script_args.model}")
 
+    enable_lora = True if script_args.adapter else False
     try:
+
+        #Temporary fix, https://github.com/vllm-project/vllm/issues/12967 should be set dynamically
         llm = LLM(
             model=script_args.model,
             revision=script_args.revision,
             tensor_parallel_size=script_args.tensor_parallel_size,
             gpu_memory_utilization=script_args.gpu_memory_utilization,
             dtype=script_args.dtype,
+            enforce_eager=True,
+            # enable_lora=enable_lora,
+            # max_lora_rank=16,
             enable_prefix_caching=script_args.enable_prefix_caching,
             max_model_len=script_args.max_model_len,
-            worker_cls="trl.scripts.vllm_serve.WeightSyncWorker",
+            worker_cls="trl.scripts.vllm_serve.WeightSyncWorker" if script_args.enable_weight_sync else "auto",
         )
         logger.info("Model loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load model: {e}", exc_info=True)
 
         logger.info(f"Loading tokenizer from: {script_args.model}")
+
+
+    if script_args.adapter:
+        logger.info(f"Loading adapter from: {script_args.adapter}")
+        lora_path = snapshot_download(script_args.adapter)
+        logger.info(f"Adapter downloaded to: {lora_path}")
+        lora_request = LoRARequest("adapter", 1, lora_path)
+    else:
+        lora_request = None
 
         
     try:
@@ -421,7 +448,7 @@ def main(script_args: ScriptArguments):
             logger.error(f"Failed to reconnect: {e}")
             return {"status": "error", "message": str(e)}
 
-    def tokenize_messages(messages, tokenizer):
+    def tokenize_messages(messages, tokenizer, sampled_h, starting_agent):
         """
         Convert messages to token IDs and attention masks.
         
@@ -434,6 +461,11 @@ def main(script_args: ScriptArguments):
         """
         MAX_LENGTH = 4096
         
+        if sampled_h is not None and starting_agent:
+            messages = messages[:2*sampled_h+2]
+        elif sampled_h is not None and not starting_agent:
+            messages = messages[:2*sampled_h+3]
+
         # Apply chat template to get the full tokenized conversation
         tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
         
@@ -465,6 +497,23 @@ def main(script_args: ScriptArguments):
                         i = end_pos  # Move i to the end of this occurrence
                         break
             i += 1
+
+        if sampled_h is not None:
+            #If there is a sampled_h I want to only keep the last set of 1s in the assistant mask (only the last assistant message e.g
+            # [0,0,1,1,0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,0,0,0,0]
+            # ->
+            # [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0]
+            indices = np.where(assistant_mask == 1)[0]
+            if len(indices) > 0:
+                # Get start and end of the last contiguous block
+                last_end = indices[-1]
+                last_start = last_end
+                while last_start > 0 and assistant_mask[last_start - 1] == 1:
+                    last_start -= 1
+
+                # Zero everything except the last block
+                assistant_mask[:] = 0
+                assistant_mask[last_start:last_end + 1] = 1
 
         return token_ids, attention_mask, assistant_mask
 
@@ -553,6 +602,7 @@ def main(script_args: ScriptArguments):
         max_tokens: int = 16
         guided_decoding_regex: Optional[str] = None
         starting_agent: Optional[bool] = None  # Override the script argument if provided
+        sampled_h: Optional[int] = None
 
     class GenerateResponse(BaseModel):
         conversations: list[list[dict]]
@@ -606,8 +656,25 @@ def main(script_args: ScriptArguments):
                 guided_decoding=request.guided_decoding_regex and 
                     GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
             )
+
+
+            sampled_h = getattr(request, 'sampled_h', None)
+            original_number_of_prompts = len(request.prompts)
+
+            print("Generating with sampled_h: ", sampled_h)
             
             for turn in range(script_args.conversation_turns):
+
+                if sampled_h is not None and turn < sampled_h:
+                    conversations = [conversations[0]]
+                    print(f"Turn {turn}/{script_args.conversation_turns}: Only one conversation")
+                elif sampled_h is not None and turn == sampled_h:
+                    base_conversation = conversations[0].copy()  # Create a copy of the conversation history
+                    conversations = [base_conversation.copy() for _ in range(original_number_of_prompts)]
+                    print(f"Turn {turn}/{script_args.conversation_turns}: {original_number_of_prompts} conversations")
+                else:
+                    print(f"Turn {turn}/{script_args.conversation_turns}: Nothing changed, still {len(conversations)} conversations")
+
                 try:
                     # If starting_agent is False and this is the first turn, let the partner go first
                     if not starting_agent and turn == 0:
@@ -620,9 +687,13 @@ def main(script_args: ScriptArguments):
                             if i < len(user_messages):
                                 conversations[i].append(user_messages[i])
                                 
-                    
+
                     # Generate responses for all conversations
                     formatted_conversations = [tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True) for conversation in conversations]
+
+                    # if lora_request:
+                    #     all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params, lora_request=lora_request)
+                    # else:
                     all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
                     
                     # Update conversations and token tracking
@@ -655,7 +726,7 @@ def main(script_args: ScriptArguments):
            
             
             for convo in conversations:
-                token_ids, attention_mask, assistant_mask = tokenize_messages(convo, tokenizer)
+                token_ids, attention_mask, assistant_mask = tokenize_messages(convo, tokenizer, sampled_h, starting_agent)
                 all_token_ids.append(token_ids)
                 all_attention_masks.append(attention_mask)
                 all_assistant_masks.append(assistant_mask)
@@ -663,8 +734,9 @@ def main(script_args: ScriptArguments):
 
             #Show decoded assistant responses
             for i, output in enumerate(conversations):
-                for j, msg in enumerate(output):
-                    print(f"Response {i+1}: {msg['content']}")
+                # print(f"Conversation {i+1}:")
+                # for j, msg in enumerate(output):
+                #     print(f"Turn {j+1} - {msg['role']}: {msg['content']}")
 
                 token = all_token_ids[i]
                 attention_mask = all_attention_masks[i]
@@ -672,10 +744,9 @@ def main(script_args: ScriptArguments):
 
                 applied_mask = assistant_mask * token
 
-                print(f"Applied mask: {applied_mask.tolist()}")
                 # Decode the token ids
                 decoded_tokens = tokenizer.decode(applied_mask)
-                print(f"Decoded tokens: {decoded_tokens}")
+                # print(f"Decoded tokens: {decoded_tokens}")
 
                 
 
@@ -720,6 +791,10 @@ def main(script_args: ScriptArguments):
                 - `port` (`int`): Port number to be used for communication.
                 - `world_size` (`int`): Total number of participating processes in the group.
         """
+
+        if not script_args.enable_weight_sync:
+            return {"message": "Weight sync is disabled, skipping communicator initialization"}
+        
         background_tasks.add_task(
             llm.collective_rpc,
             "init_communicator",
@@ -746,11 +821,12 @@ def main(script_args: ScriptArguments):
                 - `dtype` (`str`): Data type of the weight tensor (e.g., `"torch.float32"`).
                 - `shape` (list of `int`): Shape of the weight tensor.
         """
+        if not script_args.enable_weight_sync:
+            return {"message": "Weight sync is disabled, skipping weight update"}
+        
         global update_sequence_counter, update_in_progress
         update_sequence_counter += 1
         sequence_num = update_sequence_counter
-        
-        logger.info(f"SEQUENCE: Received HTTP request #{sequence_num} for param {request.name}")
         
         # Parse dtype
         dtype = torch.__getattribute__(request.dtype.split(".")[-1])
@@ -765,6 +841,9 @@ def main(script_args: ScriptArguments):
         """
         Resets the prefix cache for the model.
         """
+        if not script_args.enable_prefix_caching:
+            return {"message": "Prefix caching is disabled, skipping prefix cache reset"}
+        
         success = llm.llm_engine.reset_prefix_cache()
         return {"message": "Request received, resetting prefix cache status: " + str(success)}
 
@@ -773,6 +852,9 @@ def main(script_args: ScriptArguments):
         """
         Closes the weight update group and cleans up associated resources.
         """
+        if not script_args.enable_weight_sync:
+            return {"message": "Weight sync is disabled, skipping communicator closing"}
+        
         llm.collective_rpc("close_communicator")
         return {"message": "Request received, closing communicator"}
 
