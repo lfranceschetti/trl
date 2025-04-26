@@ -258,7 +258,6 @@ class ScriptArguments:
             "context size, which might be much larger than the KV cache, leading to inefficiencies."
         },
     )
-
     enable_prefix_caching: Optional[bool] = field(
         default=None,
         metadata={

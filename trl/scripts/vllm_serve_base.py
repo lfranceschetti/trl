@@ -307,7 +307,7 @@ class ScriptArguments:
             "`vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model "
             "context size, which might be much larger than the KV cache, leading to inefficiencies."
         },
-    ),
+    )
     enable_weight_sync: Optional[bool] = field(
         default=True,
         metadata={
@@ -350,8 +350,11 @@ def main(script_args: ScriptArguments):
 
     enable_lora = True if script_args.adapter else False
     try:
-
+        logger.info(f"Max model len: {script_args.max_model_len}")
+        if type(script_args.max_model_len) != int:
+            script_args.max_model_len = None
         #Temporary fix, https://github.com/vllm-project/vllm/issues/12967 should be set dynamically
+        
         llm = LLM(
             model=script_args.model,
             revision=script_args.revision,
@@ -448,7 +451,7 @@ def main(script_args: ScriptArguments):
             logger.error(f"Failed to reconnect: {e}")
             return {"status": "error", "message": str(e)}
 
-    def tokenize_messages(messages, tokenizer, sampled_h, starting_agent):
+    def tokenize_messages(messages, tokenizer, sampled_h, starting_agent, token_count):
         """
         Convert messages to token IDs and attention masks.
         
@@ -460,15 +463,23 @@ def main(script_args: ScriptArguments):
             Tuple of (token_ids, attention_mask, assistant_mask)
         """
         MAX_LENGTH = 4096
+
         
         if sampled_h is not None and starting_agent:
             messages = messages[:2*sampled_h+2]
         elif sampled_h is not None and not starting_agent:
             messages = messages[:2*sampled_h+3]
 
+        token_count_before = token_count
+        
+
         # Apply chat template to get the full tokenized conversation
         tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+
+        system_tokens = tokenizer.apply_chat_template([messages[0]], tokenize=True, add_generation_prompt=False)
         
+        token_count = token_count + len(tokens) - len(system_tokens)
+
         # Create properly sized tensors
         token_ids = torch.full((MAX_LENGTH,), tokenizer.pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros((MAX_LENGTH,), dtype=torch.long)
@@ -515,7 +526,11 @@ def main(script_args: ScriptArguments):
                 assistant_mask[:] = 0
                 assistant_mask[last_start:last_end + 1] = 1
 
-        return token_ids, attention_mask, assistant_mask
+                if token_count_before is not None and token_count_before > 0:
+                    token_count -= last_start
+                    token_count += len(system_tokens)
+
+        return token_ids, attention_mask, assistant_mask, token_count
 
     # Define the endpoints for the model server
     @app.get("/health/")
@@ -609,7 +624,7 @@ def main(script_args: ScriptArguments):
         token_ids: list[list[int]]
         attention_masks: list[list[int]]
         assistant_masks: list[list[int]]
-
+        total_token_count: list[int]
 
 
     @app.post("/generate/", response_model=GenerateResponse)
@@ -724,9 +739,9 @@ def main(script_args: ScriptArguments):
                     logger.error(f"Error during generation at turn {turn}: {e}")
                     # Attempt to reconnect and retry once
            
-            
+            total_token_count = 0   
             for convo in conversations:
-                token_ids, attention_mask, assistant_mask = tokenize_messages(convo, tokenizer, sampled_h, starting_agent)
+                token_ids, attention_mask, assistant_mask, total_token_count = tokenize_messages(convo, tokenizer, sampled_h, starting_agent, total_token_count)
                 all_token_ids.append(token_ids)
                 all_attention_masks.append(attention_mask)
                 all_assistant_masks.append(assistant_mask)
@@ -749,16 +764,16 @@ def main(script_args: ScriptArguments):
                 # print(f"Decoded tokens: {decoded_tokens}")
 
                 
-
+            logger.info(f"Total token count in the end: {total_token_count}")
             # Final cleanup
             await clear_cache()
-            
             # Return both conversations and tokenized data
             return {
                 "conversations": conversations,
                 "token_ids": [t.tolist() for t in all_token_ids],
                 "attention_masks": [m.tolist() for m in all_attention_masks],
-                "assistant_masks": [m.tolist() for m in all_assistant_masks]
+                "assistant_masks": [m.tolist() for m in all_assistant_masks],
+                "total_token_count": [total_token_count]
             }
             
         except Exception as e:
