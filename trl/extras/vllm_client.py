@@ -88,11 +88,13 @@ class VLLMClient:
             raise ImportError("vLLM is not installed. Please install it with `pip install vllm`.")
 
         self.session = requests.Session()
+        self.session.trust_env = False  # Bypass proxy for internal cluster communication
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
         self.check_server(connection_timeout)  # check server and fail after timeout
-        self.init_communicator()
+        self.pynccl_comm = None  # Initialize lazily when needed for weight updates
+        self._communicator_initialized = False
         atexit.register(self.close_communicator)  # when the client object is deleted, close the weight update group
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
@@ -111,7 +113,7 @@ class VLLMClient:
 
         while True:
             try:
-                response = requests.get(url)
+                response = self.session.get(url)
             except requests.exceptions.RequestException as exc:
                 # Check if the total timeout duration has passed
                 elapsed_time = time.time() - start_time
@@ -132,6 +134,7 @@ class VLLMClient:
     def generate(
         self,
         prompts: list[str],
+        prompts_2: Optional[list[str]] = None,
         n: int = 1,
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -140,13 +143,18 @@ class VLLMClient:
         min_p: float = 0.0,
         max_tokens: int = 16,
         guided_decoding_regex: Optional[str] = None,
-    ) -> list[list[str]]:
+        starting_agent: Optional[bool] = None,
+        game_configs: Optional[list] = None,
+        sampled_h: Optional[int] = None,
+    ) -> dict:
         """
         Generates model completions for the provided prompts.
 
         Args:
             prompts (`list[str]`):
                 List of text prompts for which the model will generate completions.
+            prompts_2 (`list[str]` or `None`, *optional*, defaults to `None`):
+                Optional list of second prompts (e.g., for the other agent's system prompt).
             n (`int`, *optional*, defaults to `1`):
                 Number of completions to generate for each prompt.
             repetition_penalty (`float`, *optional*, defaults to `1.0`):
@@ -163,33 +171,59 @@ class VLLMClient:
                 Maximum number of tokens to generate for each prompt.
             guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
                 Regular expression to guide the decoding process.
+            starting_agent (`bool` or `None`, *optional*, defaults to `None`):
+                Whether the starting agent is making the first move (not used by server, kept for compatibility).
+            game_configs (`list` or `None`, *optional*, defaults to `None`):
+                Optional game configurations (not used by server, kept for compatibility).
+            sampled_h (`int` or `None`, *optional*, defaults to `None`):
+                Optional sampled h value (not used by server, kept for compatibility).
 
         Returns:
-            `list[list[dict]]`: List of cnversations, each containing a list of completions for each prompt.
+            `dict`: Dictionary containing conversations, token_ids, attention_masks, and assistant_masks.
         """
         url = f"http://{self.host}:{self.server_port}/generate/"
-        response = self.session.post(
-            url,
-            json={
-                "prompts": prompts,
-                "prompts_2": prompts_2,
-                "n": n,
-                "repetition_penalty": repetition_penalty,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "max_tokens": max_tokens,
-                "guided_decoding_regex": guided_decoding_regex,
-            },
-        )
+        
+        # Build the request payload
+        payload = {
+            "prompts": prompts,
+            "n": n,
+            "repetition_penalty": repetition_penalty,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "max_tokens": max_tokens,
+        }
+        
+        # Add optional parameters
+        if prompts_2 is not None:
+            payload["prompts_2"] = prompts_2
+        if guided_decoding_regex is not None:
+            payload["guided_decoding_regex"] = guided_decoding_regex
+        
+        response = self.session.post(url, json=payload)
         if response.status_code == 200:
             data = response.json()
+            
+            # Calculate total_token_count from attention_masks (count actual tokens, not padding)
+            attention_masks = data.get("attention_masks", [])
+            total_token_count = []
+            if attention_masks:
+                for mask_list in attention_masks:
+                    # Count tokens where attention mask is 1 (non-padding tokens)
+                    total_token_count.append(sum(mask_list))
+            else:
+                # Fallback: count all token_ids if attention_masks not available
+                token_ids = data.get("token_ids", [])
+                for token_id_list in token_ids:
+                    total_token_count.append(len(token_id_list))
+            
             return {
                 "conversations": data["conversations"],
                 "token_ids": data["token_ids"],
-                "attention_masks": data["attention_masks"],
-                "assistant_masks": data["assistant_masks"]
+                "attention_masks": attention_masks,
+                "assistant_masks": data["assistant_masks"],
+                "total_token_count": total_token_count
             }
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
@@ -197,10 +231,14 @@ class VLLMClient:
     def init_communicator(self):
         """
         Initializes the weight update group in a distributed setup for model synchronization.
+        This is called lazily when weight updates are needed (e.g., in update_named_param).
         """
+        if self._communicator_initialized:
+            return  # Already initialized
+        
         # Get the tensor parallel size from the server
         url = f"http://{self.host}:{self.server_port}/get_tensor_parallel_size/"
-        response = requests.get(url)
+        response = self.session.get(url)
         if response.status_code == 200:
             tensor_parallel_size = response.json()["tensor_parallel_size"]
         else:
@@ -227,6 +265,7 @@ class VLLMClient:
 
         pg = StatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
+        self._communicator_initialized = True
 
     def update_named_param(self, name: str, weights: torch.Tensor):
         """
@@ -238,6 +277,10 @@ class VLLMClient:
             weights (`torch.Tensor`):
                 Tensor containing the updated weights.
         """
+        # Initialize communicator lazily if not already initialized
+        if not self._communicator_initialized:
+            self.init_communicator()
+        
         dtype, shape = str(weights.dtype), tuple(weights.shape)
         url = f"http://{self.host}:{self.server_port}/update_named_param/"
         response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
@@ -272,11 +315,18 @@ class VLLMClient:
     def close_communicator(self):
         """
         Closes the weight update group and cleans up the communication group.
+        Only closes if the communicator was actually initialized.
         """
+        if not self._communicator_initialized:
+            return  # Nothing to close
+        
         url = f"http://{self.host}:{self.server_port}/close_communicator/"
         response = self.session.post(url)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        
+        self._communicator_initialized = False
+        self.pynccl_comm = None
 
 
 # Example usage
