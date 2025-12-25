@@ -30,7 +30,7 @@ if is_requests_available():
 
 if is_vllm_available():
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup
+    from ..extras.stateless_group import CustomStatelessProcessGroup
 
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ class VLLMClient:
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0, enable_weight_sync: bool = True
     ):
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
@@ -92,6 +92,7 @@ class VLLMClient:
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
+        self.enable_weight_sync = enable_weight_sync
         self.check_server(connection_timeout)  # check server and fail after timeout
         self.pynccl_comm = None  # Initialize lazily when needed for weight updates
         self._communicator_initialized = False
@@ -182,46 +183,35 @@ class VLLMClient:
             `dict`: Dictionary containing conversations, token_ids, attention_masks, and assistant_masks.
         """
         url = f"http://{self.host}:{self.server_port}/generate/"
-        
-        # Build the request payload
-        payload = {
-            "prompts": prompts,
-            "n": n,
-            "repetition_penalty": repetition_penalty,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "max_tokens": max_tokens,
-        }
-        
-        # Add optional parameters
-        if prompts_2 is not None:
-            payload["prompts_2"] = prompts_2
-        if guided_decoding_regex is not None:
-            payload["guided_decoding_regex"] = guided_decoding_regex
-        
-        response = self.session.post(url, json=payload)
+
+        print("VLLM CLIENT sampled_h", sampled_h)
+
+        response = self.session.post(
+            url,
+            json={
+                "prompts": prompts,
+                "prompts_2": prompts_2,
+                "n": n,
+                "repetition_penalty": repetition_penalty,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "max_tokens": max_tokens,
+                "guided_decoding_regex": guided_decoding_regex,
+                "starting_agent": starting_agent,
+                "sampled_h": sampled_h,
+            },
+        )
         if response.status_code == 200:
             data = response.json()
-            
-            # Calculate total_token_count from attention_masks (count actual tokens, not padding)
-            attention_masks = data.get("attention_masks", [])
-            total_token_count = []
-            if attention_masks:
-                for mask_list in attention_masks:
-                    # Count tokens where attention mask is 1 (non-padding tokens)
-                    total_token_count.append(sum(mask_list))
-            else:
-                # Fallback: count all token_ids if attention_masks not available
-                token_ids = data.get("token_ids", [])
-                for token_id_list in token_ids:
-                    total_token_count.append(len(token_id_list))
-            
+            # Handle the case where total_token_count might not be in the response
+            total_token_count = data.get("total_token_count", [0])
+            logger.info(f"Total token count: {total_token_count}")
             return {
                 "conversations": data["conversations"],
                 "token_ids": data["token_ids"],
-                "attention_masks": attention_masks,
+                "attention_masks": data["attention_masks"],
                 "assistant_masks": data["assistant_masks"],
                 "total_token_count": total_token_count
             }
@@ -259,9 +249,10 @@ class VLLMClient:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
         # Set up the communication group for weight broadcasting
-        print("Initializing communicator...")
-        print(f"Host: {hostname}, Port: {self.group_port}, Rank: {self.rank}, World size: {world_size}")
-        print(f"Self.Host: {self.host}, Self.Server_Port: {self.server_port}")
+        if self.enable_weight_sync:
+            print("Initializing communicator...")
+            print(f"Host: {hostname}, Port: {self.group_port}, Rank: {self.rank}, World size: {world_size}")
+            print(f"Self.Host: {self.host}, Self.Server_Port: {self.server_port}")
 
         pg = StatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
@@ -270,6 +261,7 @@ class VLLMClient:
     def update_named_param(self, name: str, weights: torch.Tensor):
         """
         Updates a specific named parameter in the model and broadcasts it to other processes.
+        Will retry on failure and attempt to reinitialize the communicator.
 
         Args:
             name (`str`):
@@ -277,19 +269,42 @@ class VLLMClient:
             weights (`torch.Tensor`):
                 Tensor containing the updated weights.
         """
-        # Initialize communicator lazily if not already initialized
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        
         if not self._communicator_initialized:
             self.init_communicator()
-        
-        dtype, shape = str(weights.dtype), tuple(weights.shape)
-        url = f"http://{self.host}:{self.server_port}/update_named_param/"
-        response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
-        if response.status_code != 200:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
-        # Broadcast the weights to the other processes
-        self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
-        self.pynccl_comm.group.barrier()
+        for attempt in range(max_retries):
+            try:
+                dtype, shape = str(weights.dtype), tuple(weights.shape)
+                url = f"http://{self.host}:{self.server_port}/update_named_param/"
+                response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
+                if response.status_code != 200:
+                    raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+                # Broadcast the weights to the other processes
+                if self.pynccl_comm is None:
+                    logger.warning(f"Communicator not initialized for {name}, attempting to reinitialize...")
+                    self.init_communicator()
+                    
+                self.pynccl_comm.broadcast(weights, src=self.rank, stream=torch.cuda.current_stream())
+                self.pynccl_comm.group.barrier()
+                return  # Success
+                
+            except Exception as e:
+                logger.error(f"Error updating parameter {name} (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    # Try to reinitialize communicator
+                    try:
+                        self.close_communicator()
+                        self.init_communicator()
+                    except Exception as init_error:
+                        logger.error(f"Failed to reinitialize communicator: {str(init_error)}")
+                else:
+                    raise Exception(f"Failed to update parameter {name} after {max_retries} attempts") from e
 
     def update_model_params(self, model: nn.Module):
         """

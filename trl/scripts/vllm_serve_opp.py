@@ -26,7 +26,8 @@ import torch.distributed as dist
 
 from trl import TrlParser
 from trl.import_utils import is_fastapi_available, is_pydantic_available, is_uvicorn_available, is_vllm_available
-
+from vllm.lora.request import LoRARequest
+from huggingface_hub import snapshot_download
 
 if is_fastapi_available():
     from fastapi import BackgroundTasks, FastAPI
@@ -222,6 +223,10 @@ class ScriptArguments:
         default=8001,
         metadata={"help": "Host address to run the partner on"},
     )
+    adapter: str = field(
+        default=None,
+        metadata={"help": "Adapter to use for the model."},
+    )
     gpu_memory_utilization: float = field(
         default=0.9,
         metadata={
@@ -229,6 +234,13 @@ class ScriptArguments:
             "cache on the device dedicated to generation powered by vLLM. Higher values will increase the KV cache "
             "size and thus improve the model's throughput. However, if the value is too high, it may cause "
             "out-of-memory (OOM) errors during initialization."
+        },
+    )
+    quantization: str = field(
+        default=None,
+        metadata={
+            "help": "Quantization to use for vLLM generation. If set to 'auto', the quantization will be automatically "
+            "determined based on the model configuration. Find the supported values in the vLLM documentation."
         },
     )
     dtype: str = field(
@@ -274,6 +286,8 @@ def main(script_args: ScriptArguments):
     if not is_vllm_available():
         raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
 
+    print("Quantization:", script_args.quantization)
+
     llm = LLM(
         model=script_args.model,
         revision=script_args.revision,
@@ -283,10 +297,18 @@ def main(script_args: ScriptArguments):
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
         # This is particularly useful here because we generate completions from the same prompts.
+        # enable_lora=True if script_args.adapter else False,
         enable_prefix_caching=script_args.enable_prefix_caching,
         max_model_len=script_args.max_model_len,
         worker_cls="trl.scripts.vllm_serve.WeightSyncWorker",
     )
+
+    if script_args.adapter:
+        lora_path = snapshot_download(script_args.adapter)
+        lora_request = LoRARequest("adapter", 1, lora_path)
+    else:
+        lora_request = None
+
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(script_args.model)
@@ -384,6 +406,9 @@ def main(script_args: ScriptArguments):
         
         formatted_conversations = [tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=True) for convo in swapped_convos]
 
+        # if lora_request:
+        #     all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params, lora_request=lora_request)
+        # else:
         all_outputs = llm.generate(formatted_conversations, sampling_params=sampling_params)
         
         responses = []
