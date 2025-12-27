@@ -205,15 +205,16 @@ class VLLMClient:
         )
         if response.status_code == 200:
             data = response.json()
-            # Handle the case where total_token_count might not be in the response
-            total_token_count = data.get("total_token_count", [0])
-            logger.info(f"Total token count: {total_token_count}")
+            # Handle the case where generated_tokens might not be in the response (backward compatibility)
+            generated_tokens = data.get("generated_tokens", data.get("tokens_vllm", data.get("total_token_count", [0])))
+            logger.info(f"Generated tokens: {generated_tokens}")
             return {
                 "conversations": data["conversations"],
                 "token_ids": data["token_ids"],
                 "attention_masks": data["attention_masks"],
                 "assistant_masks": data["assistant_masks"],
-                "total_token_count": total_token_count
+                "total_token_count": data.get("total_token_count", [0]),  # Kept for backward compatibility
+                "generated_tokens": generated_tokens  # Token counts from vLLM outputs (one per conversation)
             }
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")

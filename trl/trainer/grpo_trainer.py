@@ -444,7 +444,9 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
-        # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
+        # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations.
+        # The effective batch size (per_device_batch_size * num_gpus) must be divisible by num_generations
+        # to ensure proper grouping for reward normalization in GRPO.
         num_processes = self.accelerator.num_processes
         global_batch_size = args.per_device_train_batch_size * num_processes
         possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
@@ -741,7 +743,9 @@ class GRPOTrainer(Trainer):
             if self.accelerator.is_main_process:
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                # prompt individually.
+                # prompt individually (shared KV cache for the prompt).
+                # Note: For single-turn generation, we use n=num_generations. For multi-turn conversations where
+                # prompts diverge after the first turn, use n=1 and handle generations via the sampler instead.
                 ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
                 with profiling_context(self, "vLLM.generate"):
                     completion_ids = self.vllm_client.generate(
