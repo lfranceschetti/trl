@@ -535,7 +535,7 @@ def main(script_args: ScriptArguments):
         """
         return {"status": "ok"}
 
-    async def interact_with_partner(session, conversations, request, script_args):
+    async def interact_with_partner(session, conversations, request, script_args, seed=None):
         """
         Separate function to handle interaction with the partner model.
         
@@ -556,7 +556,8 @@ def main(script_args: ScriptArguments):
                 "top_k": request.top_k,
                 "min_p": request.min_p,
                 "max_completion_length": request.max_completion_length,
-                "guided_decoding_regex": request.guided_decoding_regex
+                "guided_decoding_regex": request.guided_decoding_regex,
+                "seed": seed
             },
             proxies={}  # Explicitly disable proxies for internal communication
         )
@@ -629,6 +630,7 @@ def main(script_args: ScriptArguments):
         guided_decoding_regex: Optional[str] = None
         starting_agent: Optional[bool] = None  # Override the script argument if provided
         sampled_h: Optional[int] = None
+        seed: Optional[int] = None  # Random seed for deterministic generation
 
     class GenerateResponse(BaseModel):
         conversations: list[list[dict]]
@@ -688,6 +690,10 @@ def main(script_args: ScriptArguments):
             # Configure sampling parameters
             # Note: For multi-turn conversations, n should be 1. The code only uses output.outputs[0],
             # so additional generations would be wasted computation and break token counting logic.
+            # Use the request seed as a base; derive per-turn seeds for reproducibility
+            base_seed = request.seed
+            opp_seed = (base_seed + 1_000_000) if base_seed is not None else None
+
             sampling_params = SamplingParams(
                 n=request.n,
                 repetition_penalty=request.repetition_penalty,
@@ -696,10 +702,10 @@ def main(script_args: ScriptArguments):
                 top_k=request.top_k,
                 min_p=request.min_p,
                 max_tokens=request.max_completion_length,
+                seed=base_seed,
                 guided_decoding=request.guided_decoding_regex and 
                     GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
             )
-
 
             sampled_h = getattr(request, 'sampled_h', None)
             original_number_of_prompts = len(request.prompts)
@@ -727,7 +733,7 @@ def main(script_args: ScriptArguments):
                     if not starting_agent and turn == 0:
                         # Partner model goes first
                         logger.info(f"Turn {turn}: Partner model starts the conversation (starting_agent=False)")
-                        user_messages, partner_token_counts = await interact_with_partner(session, conversations, request, script_args)
+                        user_messages, partner_token_counts = await interact_with_partner(session, conversations, request, script_args, seed=opp_seed)
                         
                         # Update all conversations with user messages
                         for i in range(len(conversations)):
@@ -789,7 +795,7 @@ def main(script_args: ScriptArguments):
                     else:
                         logger.info(f"Turn {turn}: Getting response from partner model")
                         user_messages, partner_token_counts = await interact_with_partner(
-                            session, conversations, request, script_args)
+                            session, conversations, request, script_args, seed=opp_seed)
                         
                         # Update all conversations with user messages
                         for i in range(len(conversations)):

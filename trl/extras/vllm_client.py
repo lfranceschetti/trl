@@ -147,6 +147,7 @@ class VLLMClient:
         starting_agent: Optional[bool] = None,
         game_configs: Optional[list] = None,
         sampled_h: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> dict:
         """
         Generates model completions for the provided prompts.
@@ -201,6 +202,7 @@ class VLLMClient:
                 "guided_decoding_regex": guided_decoding_regex,
                 "starting_agent": starting_agent,
                 "sampled_h": sampled_h,
+                "seed": seed,
             },
         )
         if response.status_code == 200:
@@ -257,7 +259,7 @@ class VLLMClient:
             print(f"Host: {hostname}, Port: {self.group_port}, Rank: {self.rank}, World size: {world_size}")
             print(f"Self.Host: {self.host}, Self.Server_Port: {self.server_port}")
 
-        pg = StatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
+        pg = CustomStatelessProcessGroup.create(host=hostname, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device="cuda:0")
         self._communicator_initialized = True
 

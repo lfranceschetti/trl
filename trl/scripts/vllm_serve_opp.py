@@ -360,6 +360,7 @@ def main(script_args: ScriptArguments):
         min_p: float = 0.0
         max_completion_length: int = 16
         guided_decoding_regex: Optional[str] = None
+        seed: Optional[int] = None  # Random seed for deterministic generation
 
     class GenerateResponse(BaseModel):
         responses: list[str]
@@ -384,6 +385,7 @@ def main(script_args: ScriptArguments):
             top_k=request.top_k,
             min_p=request.min_p,
             max_tokens=request.max_completion_length,
+            seed=request.seed,
             guided_decoding=request.guided_decoding_regex and 
                 GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
         )
