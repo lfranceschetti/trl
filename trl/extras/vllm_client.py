@@ -142,7 +142,7 @@ class VLLMClient:
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
-        max_tokens: int = 16,
+        max_completion_length: int = 16,
         guided_decoding_regex: Optional[str] = None,
         starting_agent: Optional[bool] = None,
         game_configs: Optional[list] = None,
@@ -168,8 +168,8 @@ class VLLMClient:
                 Top-k sampling parameter. `-1` means no truncation.
             min_p (`float`, *optional*, defaults to `0.0`):
                 Minimum probability for sampling.
-            max_tokens (`int`, *optional*, defaults to `16`):
-                Maximum number of tokens to generate for each prompt.
+            max_completion_length (`int`, *optional*, defaults to `16`):
+                Maximum number of tokens to generate for each turn.
             guided_decoding_regex (`str` or `None`, *optional*, defaults to `None`):
                 Regular expression to guide the decoding process.
             starting_agent (`bool` or `None`, *optional*, defaults to `None`):
@@ -197,7 +197,7 @@ class VLLMClient:
                 "top_p": top_p,
                 "top_k": top_k,
                 "min_p": min_p,
-                "max_tokens": max_tokens,
+                "max_completion_length": max_completion_length,
                 "guided_decoding_regex": guided_decoding_regex,
                 "starting_agent": starting_agent,
                 "sampled_h": sampled_h,
@@ -205,16 +205,18 @@ class VLLMClient:
         )
         if response.status_code == 200:
             data = response.json()
-            # Handle the case where generated_tokens might not be in the response (backward compatibility)
-            generated_tokens = data.get("generated_tokens", data.get("tokens_vllm", data.get("total_token_count", [0])))
-            logger.info(f"Generated tokens: {generated_tokens}")
+            # Handle the case where generated_tokens_agent/opp might not be in the response (backward compatibility)
+            generated_tokens_agent = data.get("generated_tokens_agent", [0])
+            generated_tokens_opp = data.get("generated_tokens_opp", [0])
+            logger.info(f"Generated tokens - base: {generated_tokens_agent}, opp: {generated_tokens_opp}")
             return {
                 "conversations": data["conversations"],
                 "token_ids": data["token_ids"],
                 "attention_masks": data["attention_masks"],
                 "assistant_masks": data["assistant_masks"],
                 "total_token_count": data.get("total_token_count", [0]),  # Kept for backward compatibility
-                "generated_tokens": generated_tokens  # Token counts from vLLM outputs (one per conversation)
+                "generated_tokens_agent": generated_tokens_agent,  # Token counts from base model (one per conversation)
+                "generated_tokens_opp": generated_tokens_opp  # Token counts from opponent model (one per conversation)
             }
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
@@ -352,7 +354,7 @@ if __name__ == "__main__":
     client = VLLMClient()
 
     # Generate completions
-    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_tokens=32, sampling_params=SamplingParams())
+    responses = client.generate(["Hello, AI!", "Tell me a joke"], n=4, max_completion_length=32, sampling_params=SamplingParams())
     print("Responses:", responses)  # noqa
 
     # Update model weights

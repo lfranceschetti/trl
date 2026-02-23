@@ -251,7 +251,7 @@ class ScriptArguments:
         },
     )
     max_model_len: Optional[int] = field(
-        default=None,
+        default=4096,
         metadata={
             "help": "If set, the `max_model_len` to use for vLLM. This can be useful when running with reduced "
             "`vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model "
@@ -358,7 +358,7 @@ def main(script_args: ScriptArguments):
         top_p: float = 1.0
         top_k: int = -1
         min_p: float = 0.0
-        max_tokens: int = 16
+        max_completion_length: int = 16
         guided_decoding_regex: Optional[str] = None
 
     class GenerateResponse(BaseModel):
@@ -383,7 +383,7 @@ def main(script_args: ScriptArguments):
             top_p=request.top_p,
             top_k=request.top_k,
             min_p=request.min_p,
-            max_tokens=request.max_tokens,
+            max_tokens=request.max_completion_length,
             guided_decoding=request.guided_decoding_regex and 
                 GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
         )

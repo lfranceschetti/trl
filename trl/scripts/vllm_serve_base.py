@@ -302,7 +302,7 @@ class ScriptArguments:
         },
     )
     max_model_len: Optional[int] = field(
-        default=None,
+        default=4096,
         metadata={
             "help": "If set, the `max_model_len` to use for vLLM. This can be useful when running with reduced "
             "`vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model "
@@ -452,7 +452,7 @@ def main(script_args: ScriptArguments):
             logger.error(f"Failed to reconnect: {e}")
             return {"status": "error", "message": str(e)}
 
-    def tokenize_messages(messages, tokenizer, sampled_h, starting_agent):
+    def tokenize_messages(messages, tokenizer, sampled_h, starting_agent, max_length):
         """
         Convert messages to token IDs and attention masks.
         
@@ -461,11 +461,11 @@ def main(script_args: ScriptArguments):
             tokenizer: Tokenizer to use
             sampled_h: Optional parameter for sampled history
             starting_agent: Whether this agent starts the conversation
+            max_length: Maximum sequence length (from max_model_len)
             
         Returns:
             Tuple of (token_ids, attention_mask, assistant_mask)
         """
-        MAX_LENGTH = 4096
 
         
         if sampled_h is not None and starting_agent:
@@ -477,11 +477,11 @@ def main(script_args: ScriptArguments):
         tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
 
         # Create properly sized tensors
-        token_ids = torch.full((MAX_LENGTH,), tokenizer.pad_token_id, dtype=torch.long)
-        assistant_mask = torch.zeros((MAX_LENGTH,), dtype=torch.long)
+        token_ids = torch.full((max_length,), tokenizer.pad_token_id, dtype=torch.long)
+        assistant_mask = torch.zeros((max_length,), dtype=torch.long)
 
-        # Fill tensors with actual content up to min(tokens.size(1), MAX_LENGTH)
-        length = min(len(tokens), MAX_LENGTH)
+        # Fill tensors with actual content up to min(tokens.size(1), max_length)
+        length = min(len(tokens), max_length)
         token_ids[:length] = torch.tensor(tokens[:length])
         
         # Create attention mask based on pad token comparison (standard approach)
@@ -555,7 +555,7 @@ def main(script_args: ScriptArguments):
                 "top_p": request.top_p,
                 "top_k": request.top_k,
                 "min_p": request.min_p,
-                "max_tokens": request.max_tokens,
+                "max_completion_length": request.max_completion_length,
                 "guided_decoding_regex": request.guided_decoding_regex
             },
             proxies={}  # Explicitly disable proxies for internal communication
@@ -625,7 +625,7 @@ def main(script_args: ScriptArguments):
         top_p: float = 1.0
         top_k: int = 50
         min_p: float = 0.0
-        max_tokens: int = 16
+        max_completion_length: int = 16  # Maximum tokens per utterance/turn, not total for the entire conversation
         guided_decoding_regex: Optional[str] = None
         starting_agent: Optional[bool] = None  # Override the script argument if provided
         sampled_h: Optional[int] = None
@@ -636,7 +636,8 @@ def main(script_args: ScriptArguments):
         attention_masks: list[list[int]]
         assistant_masks: list[list[int]]
         total_token_count: list[int]  # Alternative counting method (kept for backward compatibility)
-        generated_tokens: list[int]  # Token counts from vLLM outputs (one per conversation)
+        generated_tokens_agent: list[int]  # Token counts from base model (one per conversation)
+        generated_tokens_opp: list[int]  # Token counts from opponent model (one per conversation)
 
 
     @app.post("/generate/", response_model=GenerateResponse)
@@ -673,7 +674,6 @@ def main(script_args: ScriptArguments):
             all_token_ids = []
             all_attention_masks = []
             all_assistant_masks = []
-            max_length = 4096
             
             # Determine which agent starts the conversation
             starting_agent = request.starting_agent if request.starting_agent is not None else script_args.starting_agent
@@ -695,7 +695,7 @@ def main(script_args: ScriptArguments):
                 top_p=request.top_p,
                 top_k=request.top_k,
                 min_p=request.min_p,
-                max_tokens=request.max_tokens,
+                max_tokens=request.max_completion_length,
                 guided_decoding=request.guided_decoding_regex and 
                     GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
             )
@@ -704,7 +704,9 @@ def main(script_args: ScriptArguments):
             sampled_h = getattr(request, 'sampled_h', None)
             original_number_of_prompts = len(request.prompts)
             # Get number of tokens as an array with length of original_number_of_prompts
-            generated_tokens = [0] * original_number_of_prompts
+            # Track base model tokens and opponent tokens separately
+            generated_tokens_agent = [0] * original_number_of_prompts
+            generated_tokens_opp = [0] * original_number_of_prompts
 
             print("Generating with sampled_h: ", sampled_h)
             
@@ -732,22 +734,22 @@ def main(script_args: ScriptArguments):
                             if i < len(user_messages):
                                 conversations[i].append(user_messages[i])
                         
-                        # Add partner tokens to generated_tokens
+                        # Add partner tokens to generated_tokens_opp
                         # When sampled_h is used and we're in the single conversation phase (turn < sampled_h),
-                        # only one conversation exists, so only add tokens to generated_tokens[0]
+                        # only one conversation exists, so only add tokens to generated_tokens_opp[0]
                         # After conversations split (turn >= sampled_h), add tokens for each conversation
                         if len(partner_token_counts) > 0:
                             if sampled_h is not None and turn < sampled_h:
                                 # Single conversation phase: only one token count exists
-                                generated_tokens[0] += partner_token_counts[0]
-                                print(f"Partner tokens added at turn {turn} for prompt 0 (single conversation phase): {partner_token_counts[0]}, total: {generated_tokens[0]}")
+                                generated_tokens_opp[0] += partner_token_counts[0]
+                                print(f"Partner tokens added at turn {turn} for prompt 0 (single conversation phase): {partner_token_counts[0]}, total opp: {generated_tokens_opp[0]}")
                             else:
                                 # Multiple conversations phase: add tokens for each conversation
                                 for i in range(len(conversations)):
                                     if i < len(partner_token_counts):
-                                        conv_idx = i if i < len(generated_tokens) else len(generated_tokens) - 1
-                                        generated_tokens[conv_idx] += partner_token_counts[i]
-                                        print(f"Partner tokens added at turn {turn} for prompt {conv_idx}: {partner_token_counts[i]}, total: {generated_tokens[conv_idx]}")
+                                        conv_idx = i if i < len(generated_tokens_opp) else len(generated_tokens_opp) - 1
+                                        generated_tokens_opp[conv_idx] += partner_token_counts[i]
+                                        print(f"Partner tokens added at turn {turn} for prompt {conv_idx}: {partner_token_counts[i]}, total opp: {generated_tokens_opp[conv_idx]}")
                                 
 
                     # Generate responses for all conversations
@@ -764,17 +766,17 @@ def main(script_args: ScriptArguments):
                         this_model_response = output.outputs[0].text
                         conversations[i].append({"role": "assistant", "content": this_model_response})
                         # When sampled_h is used and we're in the single conversation phase, 
-                        # only update generated_tokens[0]. When conversations expand, update the corresponding index.
+                        # only update generated_tokens_agent[0]. When conversations expand, update the corresponding index.
                         if sampled_h is not None and turn < sampled_h:
-                            generated_tokens[0] += len(output.outputs[0].token_ids)
-                            print(f"Tokens in VLLM at turn {turn} for prompt 0 (single conversation phase): {generated_tokens[0]}")
+                            generated_tokens_agent[0] += len(output.outputs[0].token_ids)
+                            print(f"Base tokens in VLLM at turn {turn} for prompt 0 (single conversation phase): {generated_tokens_agent[0]}")
                         else:
                             # Map conversation index to original prompt index
                             # When conversations expand at turn == sampled_h, all conversations share the same base
                             # so we need to map correctly. For now, use the conversation index directly.
-                            conv_idx = i if i < len(generated_tokens) else len(generated_tokens) - 1
-                            generated_tokens[conv_idx] += len(output.outputs[0].token_ids)
-                            print(f"Tokens in VLLM at turn {turn} for prompt {conv_idx}: {generated_tokens[conv_idx]}")
+                            conv_idx = i if i < len(generated_tokens_agent) else len(generated_tokens_agent) - 1
+                            generated_tokens_agent[conv_idx] += len(output.outputs[0].token_ids)
+                            print(f"Base tokens in VLLM at turn {turn} for prompt {conv_idx}: {generated_tokens_agent[conv_idx]}")
 
                
                     
@@ -794,52 +796,52 @@ def main(script_args: ScriptArguments):
                             if i < len(user_messages):
                                 conversations[i].append(user_messages[i])
                         
-                        # Add partner tokens to generated_tokens
+                        # Add partner tokens to generated_tokens_opp
                         # When sampled_h is used and we're in the single conversation phase (turn < sampled_h),
-                        # only one conversation exists, so only add tokens to generated_tokens[0]
+                        # only one conversation exists, so only add tokens to generated_tokens_opp[0]
                         # After conversations split (turn >= sampled_h), add tokens for each conversation
                         if len(partner_token_counts) > 0:
                             if sampled_h is not None and turn < sampled_h:
                                 # Single conversation phase: only one token count exists
-                                generated_tokens[0] += partner_token_counts[0]
-                                print(f"Partner tokens added at turn {turn} for prompt 0 (single conversation phase): {partner_token_counts[0]}, total: {generated_tokens[0]}")
+                                generated_tokens_opp[0] += partner_token_counts[0]
+                                print(f"Partner tokens added at turn {turn} for prompt 0 (single conversation phase): {partner_token_counts[0]}, total opp: {generated_tokens_opp[0]}")
                             else:
                                 # Multiple conversations phase: add tokens for each conversation
                                 for i in range(len(conversations)):
                                     if i < len(partner_token_counts):
-                                        conv_idx = i if i < len(generated_tokens) else len(generated_tokens) - 1
-                                        generated_tokens[conv_idx] += partner_token_counts[i]
-                                        print(f"Partner tokens added at turn {turn} for prompt {conv_idx}: {partner_token_counts[i]}, total: {generated_tokens[conv_idx]}")
+                                        conv_idx = i if i < len(generated_tokens_opp) else len(generated_tokens_opp) - 1
+                                        generated_tokens_opp[conv_idx] += partner_token_counts[i]
+                                        print(f"Partner tokens added at turn {turn} for prompt {conv_idx}: {partner_token_counts[i]}, total opp: {generated_tokens_opp[conv_idx]}")
                        
                 except Exception as e:
                     logger.error(f"Error during generation at turn {turn}: {e}")
                     # Attempt to reconnect and retry once
            
             for convo in conversations:
-                token_ids, attention_mask, assistant_mask = tokenize_messages(convo, tokenizer, sampled_h, starting_agent)
+                token_ids, attention_mask, assistant_mask = tokenize_messages(convo, tokenizer, sampled_h, starting_agent, script_args.max_model_len)
                 all_token_ids.append(token_ids)
                 all_attention_masks.append(attention_mask)
                 all_assistant_masks.append(assistant_mask)
 
 
             #Show decoded assistant responses
-            for i, output in enumerate(conversations):
-                # print(f"Conversation {i+1}:")
-                # for j, msg in enumerate(output):
-                #     print(f"Turn {j+1} - {msg['role']}: {msg['content']}")
+            # for i, output in enumerate(conversations):
+            #     # print(f"Conversation {i+1}:")
+            #     # for j, msg in enumerate(output):
+            #     #     print(f"Turn {j+1} - {msg['role']}: {msg['content']}")
 
-                token = all_token_ids[i]
-                attention_mask = all_attention_masks[i]
-                assistant_mask = all_assistant_masks[i]
+            #     token = all_token_ids[i]
+            #     attention_mask = all_attention_masks[i]
+            #     assistant_mask = all_assistant_masks[i]
 
-                applied_mask = assistant_mask * token
+            #     applied_mask = assistant_mask * token
 
-                # Decode the token ids
-                decoded_tokens = tokenizer.decode(applied_mask)
-                # print(f"Decoded tokens: {decoded_tokens}")
+            #     # Decode the token ids
+            #     decoded_tokens = tokenizer.decode(applied_mask)
+            #     # print(f"Decoded tokens: {decoded_tokens}")
 
                 
-            logger.info(f"Generated tokens: {generated_tokens}")
+            logger.info(f"Generated tokens base: {generated_tokens_agent}, opp: {generated_tokens_opp}")
             # Final cleanup
             await clear_cache()
             # Return both conversations and tokenized data
@@ -848,8 +850,9 @@ def main(script_args: ScriptArguments):
                 "token_ids": [t.tolist() for t in all_token_ids],
                 "attention_masks": [m.tolist() for m in all_attention_masks],
                 "assistant_masks": [m.tolist() for m in all_assistant_masks],
-                "total_token_count": [],  # Deprecated: kept for backward compatibility, use generated_tokens instead
-                "generated_tokens": generated_tokens  # Token counts from vLLM outputs (one per conversation)
+                "total_token_count": [],  # Deprecated: kept for backward compatibility
+                "generated_tokens_agent": generated_tokens_agent,  # Token counts from base model (one per conversation)
+                "generated_tokens_opp": generated_tokens_opp  # Token counts from opponent model (one per conversation)
             }
             
         except Exception as e:

@@ -391,7 +391,7 @@ def main(script_args: ScriptArguments):
         top_p: float = 1.0
         top_k: int = -1
         min_p: float = 0.0
-        max_tokens: int = 16
+        max_completion_length: int = 16
         guided_decoding_regex: Optional[str] = None
 
     class GenerateResponse(BaseModel):
@@ -435,7 +435,7 @@ def main(script_args: ScriptArguments):
             top_p=request.top_p,
             top_k=request.top_k,
             min_p=request.min_p,
-            max_tokens=request.max_tokens,
+            max_tokens=request.max_completion_length,
             guided_decoding=guided_decoding,
         )
         all_outputs = llm.generate(request.prompts, sampling_params=sampling_params)

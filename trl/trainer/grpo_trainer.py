@@ -756,7 +756,7 @@ class GRPOTrainer(Trainer):
                         top_p=self.top_p,
                         top_k=-1 if self.top_k is None else self.top_k,
                         min_p=0.0 if self.min_p is None else self.min_p,
-                        max_tokens=self.max_completion_length,
+                        max_completion_length=self.max_completion_length,
                         guided_decoding_regex=self.guided_decoding_regex,
                     )
             else:
