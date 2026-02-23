@@ -505,6 +505,12 @@ class VLLMClient:
             # Update each parameter individually
             self.update_named_param(name, param.data)
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str) -> None:
+        """Tell the vLLM server to load/reload a LoRA adapter from disk."""
+        url = f"{self.base_url}/load_lora_adapter/"
+        response = self.session.post(url, json={"lora_name": lora_name, "lora_path": lora_path})
+        response.raise_for_status()
+
     def reset_prefix_cache(self):
         """
         Resets the prefix cache for the model.

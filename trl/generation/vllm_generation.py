@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -188,6 +189,8 @@ class VLLMGeneration:
         # vLLM configuration
         mode: str = "server",
         structured_outputs_regex: str | None = None,
+        sync_strategy: str = "weights",
+        lora_name: str = "policy",
         # Server mode configuration
         server_base_url: str | None = None,
         server_host: str = "0.0.0.0",
@@ -223,6 +226,8 @@ class VLLMGeneration:
         # vLLM configuration
         self.mode = mode
         self.structured_outputs_regex = structured_outputs_regex
+        self.sync_strategy = sync_strategy
+        self.lora_name = lora_name
 
         # Server mode configuration
         self.server_base_url = server_base_url
@@ -276,7 +281,8 @@ class VLLMGeneration:
                 self.vllm_client = VLLMClient(
                     base_url=base_url, group_port=self.group_port, connection_timeout=self.server_timeout
                 )
-                self.vllm_client.init_communicator(device=torch.cuda.current_device())
+                if self.sync_strategy != "lora_adapter":
+                    self.vllm_client.init_communicator(device=torch.cuda.current_device())
 
         elif self.mode == "colocate":
             # Make sure tensor_parallel_size group size evenly divides the world size - each group should have
@@ -403,6 +409,51 @@ class VLLMGeneration:
             elif self.mode == "colocate":
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
+
+    def sync_lora_adapter(self, output_dir: str):
+        """Save LoRA adapter to disk and tell vLLM server to reload it.
+
+        This avoids the merge_adapter/unmerge_adapter cycle and NCCL weight transfer,
+        which is problematic for QLoRA (4-bit) models and slow for large models.
+
+        Args:
+            output_dir: Base output directory. The adapter is saved under ``{output_dir}/vllm_lora_adapter/``.
+        """
+        accelerator = self.accelerator
+
+        # With DeepSpeed ZeRO-3, adapter parameters are sharded and must be gathered before saving
+        deepspeed_plugin = accelerator.state.deepspeed_plugin
+        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+        if zero_stage_3:
+            import deepspeed
+
+            gather_if_zero3 = deepspeed.zero.GatheredParameters
+        else:
+            gather_if_zero3 = nullcontext
+
+        if accelerator.is_main_process:
+            adapter_dir = os.path.join(output_dir, "vllm_lora_adapter")
+            tmp_dir = adapter_dir + "_tmp"
+
+            # Save adapter (only LoRA params, ~50-200MB)
+            unwrapped = accelerator.unwrap_model(self.model)
+            with gather_if_zero3(list(unwrapped.parameters())):
+                unwrapped.save_pretrained(tmp_dir)
+
+            # Atomic swap to avoid vLLM reading a partially-written adapter
+            if os.path.exists(adapter_dir):
+                shutil.rmtree(adapter_dir)
+            os.rename(tmp_dir, adapter_dir)
+
+            # Tell vLLM to reload
+            self.vllm_client.load_lora_adapter(
+                lora_name=self.lora_name,
+                lora_path=adapter_dir,
+            )
+
+        # Sync all processes
+        if accelerator.num_processes > 1:
+            accelerator.wait_for_everyone()
 
     def sync_weights(self):
         """Synchronize model weights to vLLM.
