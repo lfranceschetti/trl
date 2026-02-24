@@ -532,6 +532,17 @@ class GRPOTrainer(BaseTrainer):
         self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
         self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
         self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
+
+        if args.vllm_sync_strategy == "lora_adapter":
+            if args.vllm_mode != "server":
+                raise ValueError(
+                    'vllm_sync_strategy="lora_adapter" is only supported with vllm_mode="server".'
+                )
+            if not (is_peft_available() and is_peft_model(model)):
+                raise ValueError(
+                    'vllm_sync_strategy="lora_adapter" requires a PEFT model. '
+                    "Pass a peft_config or a pre-wrapped PeftModel."
+                )
         self.use_liger_kernel = args.use_liger_kernel
         self.loss_type = args.loss_type
         self.multi_objective_aggregation = args.multi_objective_aggregation
@@ -716,6 +727,8 @@ class GRPOTrainer(BaseTrainer):
                 # vLLM configuration
                 mode=args.vllm_mode,
                 structured_outputs_regex=args.vllm_structured_outputs_regex,
+                sync_strategy=args.vllm_sync_strategy,
+                lora_name=args.vllm_lora_name,
                 # Server mode configuration
                 server_base_url=args.vllm_server_base_url,
                 server_host=args.vllm_server_host,
@@ -1219,7 +1232,10 @@ class GRPOTrainer(BaseTrainer):
             # Sync weights if training step changed
             if self.state.global_step != self._last_loaded_step:
                 with profiling_context(self, "sync_weights"):
-                    self.vllm_generation.sync_weights()
+                    if self.args.vllm_sync_strategy == "lora_adapter":
+                        self.vllm_generation.sync_lora_adapter(self.args.output_dir)
+                    else:
+                        self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
 
             # Generate using vLLM
