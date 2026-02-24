@@ -14,11 +14,13 @@
 
 """vLLM-based generation backend for TRL trainers."""
 
+import atexit
 import json
 import logging
 import math
 import os
 import shutil
+import tempfile
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -410,18 +412,60 @@ class VLLMGeneration:
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
 
+    def _get_lora_adapter_dir(self, output_dir: str) -> str:
+        """Return the directory for storing the LoRA adapter, preferring in-memory filesystems.
+
+        Prefers ``/dev/shm`` (Linux tmpfs, RAM-backed) for speed, since the adapter is ephemeral and
+        small (~50-200 MB). Falls back to a temp directory (often tmpfs on Linux), then to
+        ``output_dir`` as a last resort. The chosen path is cached and an ``atexit`` handler is
+        registered to clean it up on exit.
+
+        Both the trainer and vLLM server must be on the same machine (shared filesystem) for the
+        path to be readable by both processes.
+        """
+        if hasattr(self, "_lora_adapter_dir"):
+            return self._lora_adapter_dir
+
+        # Use PID to avoid collisions between concurrent training runs on the same machine
+        subdir = f"trl_lora_{os.getpid()}"
+
+        # Try /dev/shm first (Linux RAM-backed tmpfs, almost always available)
+        dev_shm = "/dev/shm"
+        if os.path.isdir(dev_shm) and os.access(dev_shm, os.W_OK):
+            adapter_dir = os.path.join(dev_shm, subdir)
+        else:
+            # Fall back to system temp directory (often tmpfs on Linux, disk-backed elsewhere)
+            adapter_dir = os.path.join(tempfile.gettempdir(), subdir)
+
+        os.makedirs(adapter_dir, exist_ok=True)
+        self._lora_adapter_dir = adapter_dir
+        logger.info(f"LoRA adapter sync directory: {adapter_dir}")
+
+        # Clean up on exit so we don't leak files in /dev/shm or /tmp
+        def _cleanup():
+            if os.path.exists(adapter_dir):
+                shutil.rmtree(adapter_dir, ignore_errors=True)
+
+        atexit.register(_cleanup)
+        return adapter_dir
+
     def sync_lora_adapter(self, output_dir: str):
-        """Save LoRA adapter to disk and tell vLLM server to reload it.
+        """Save LoRA adapter and tell vLLM server to reload it.
 
         This avoids the merge_adapter/unmerge_adapter cycle and NCCL weight transfer,
         which is problematic for QLoRA (4-bit) models and slow for large models.
 
+        The adapter is written to an in-memory filesystem (``/dev/shm``) when available for speed,
+        falling back to the system temp directory or ``output_dir``.
+
         Args:
-            output_dir: Base output directory. The adapter is saved under ``{output_dir}/vllm_lora_adapter/``.
+            output_dir: Trainer output directory, used as a fallback if no in-memory FS is available.
         """
         accelerator = self.accelerator
 
-        # With DeepSpeed ZeRO-3, adapter parameters are sharded and must be gathered before saving
+        # With DeepSpeed ZeRO-3, adapter parameters are sharded and must be gathered before saving.
+        # GatheredParameters is a collective operation — all ranks must participate — so we call it
+        # outside the is_main_process guard, but only main process writes to disk.
         deepspeed_plugin = accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         if zero_stage_3:
@@ -431,25 +475,30 @@ class VLLMGeneration:
         else:
             gather_if_zero3 = nullcontext
 
-        if accelerator.is_main_process:
-            adapter_dir = os.path.join(output_dir, "vllm_lora_adapter")
-            tmp_dir = adapter_dir + "_tmp"
+        unwrapped = accelerator.unwrap_model(self.model)
+        with gather_if_zero3(list(unwrapped.parameters())):
+            if accelerator.is_main_process:
+                base_dir = self._get_lora_adapter_dir(output_dir)
+                adapter_dir = os.path.join(base_dir, "adapter")
+                tmp_dir = os.path.join(base_dir, "adapter_tmp")
 
-            # Save adapter (only LoRA params, ~50-200MB)
-            unwrapped = accelerator.unwrap_model(self.model)
-            with gather_if_zero3(list(unwrapped.parameters())):
+                # Clean up any stale tmp dir from a previous failed save
+                if os.path.exists(tmp_dir):
+                    shutil.rmtree(tmp_dir)
+
+                # Save adapter (only LoRA params, ~50-200MB)
                 unwrapped.save_pretrained(tmp_dir)
 
-            # Atomic swap to avoid vLLM reading a partially-written adapter
-            if os.path.exists(adapter_dir):
-                shutil.rmtree(adapter_dir)
-            os.rename(tmp_dir, adapter_dir)
+                # Atomic swap to avoid vLLM reading a partially-written adapter
+                if os.path.exists(adapter_dir):
+                    shutil.rmtree(adapter_dir)
+                os.rename(tmp_dir, adapter_dir)
 
-            # Tell vLLM to reload
-            self.vllm_client.load_lora_adapter(
-                lora_name=self.lora_name,
-                lora_path=adapter_dir,
-            )
+                # Tell vLLM to reload
+                self.vllm_client.load_lora_adapter(
+                    lora_name=self.lora_name,
+                    lora_path=adapter_dir,
+                )
 
         # Sync all processes
         if accelerator.num_processes > 1:

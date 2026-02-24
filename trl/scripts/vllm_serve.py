@@ -853,6 +853,8 @@ def main(script_args: ScriptArguments):
                 "chat_template_kwargs": request.chat_template_kwargs,
                 "tools": request.tools if request.tools else None,
             }
+            if lora_state["request"] is not None:
+                kwargs["lora_request"] = lora_state["request"]
 
             connection.send({"type": "call", "method": "chat", "kwargs": kwargs})
 
@@ -1093,11 +1095,14 @@ def main(script_args: ScriptArguments):
             for connection, prompts in zip(connections, chunked_prompts, strict=True):
                 if not prompts:
                     prompts = [{"prompt_token_ids": [tokenizer.eos_token_id]}]
+                gen_kwargs = {"prompts": prompts, "sampling_params": sampling_params}
+                if lora_state["request"] is not None:
+                    gen_kwargs["lora_request"] = lora_state["request"]
                 connection.send(
                     {
                         "type": "call",
                         "method": "generate",
-                        "kwargs": {"prompts": prompts, "sampling_params": sampling_params},
+                        "kwargs": gen_kwargs,
                     }
                 )
         else:
@@ -1113,6 +1118,8 @@ def main(script_args: ScriptArguments):
                     "tools": request.tools,
                     "chat_template_kwargs": chat_template_kwargs,
                 }
+                if lora_state["request"] is not None:
+                    kwargs["lora_request"] = lora_state["request"]
                 connection.send({"type": "call", "method": "chat", "kwargs": kwargs})
 
         all_outputs = [connection.recv() for connection in connections]
