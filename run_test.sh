@@ -4,8 +4,8 @@
 #SBATCH --nodes=1                # Number of nodes
 #SBATCH --ntasks=1          
 #SBATCH --gpus=rtx_4090:2
-#SBATCH --output=run_new.out
-#SBATCH --error=run_new.err
+#SBATCH --output=run_test.out
+#SBATCH --error=run_test.err
 
 
 set -euo pipefail
@@ -52,15 +52,18 @@ nvidia-smi
 # Path to your local TRL checkout (this repo, with your PR changes)
 VLLM_PORT="${VLLM_PORT:-8000}"
 MODEL_ID="${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
-RUN_NAME="${RUN_NAME:-grpo_lora_sync_smoke}"
-WANDB_PROJECT="${WANDB_PROJECT:-grpo_lora_sync_smoke}"
+RUN_NAME="${RUN_NAME:-grpo_lora_length_reward}"
+WANDB_PROJECT="${WANDB_PROJECT:-grpo_lora_length_reward}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 
 # venv per job (recommended on clusters)
-ENV_DIR="${SLURM_TMPDIR:-/tmp}/trl_venv"
+# Use a unique environment per run to avoid stale/corrupted metadata from prior jobs.
+ENV_DIR="${SLURM_TMPDIR:-/tmp}/trl_venv_${SLURM_JOB_ID:-$$}"
+rm -rf "$ENV_DIR"
 python3 -m venv "$ENV_DIR"
 source "$ENV_DIR/bin/activate"
-python -m pip install -U pip wheel setuptools
+# Keep pip on a stable release line for this cluster stack.
+python -m pip install -U "pip<26" wheel setuptools
 
 # Install TRL with vLLM extras, from your local repo (so it uses your modifications).
 # TRL docs: pip install "trl[vllm]" for vLLM integration. :contentReference[oaicite:1]{index=1}
@@ -162,7 +165,8 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch \
   --num_machines 1 \
   --mixed_precision bf16 \
   --dynamo_backend no \
-  "$TRL_REPO/run.py"
+  "$TRL_REPO/run_test.py" \
+  --quantized
 # Cleanup server
 echo "Stopping vLLM server..."
 kill $VLLM_PID || true

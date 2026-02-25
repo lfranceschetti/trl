@@ -463,9 +463,10 @@ class VLLMGeneration:
         """
         accelerator = self.accelerator
 
-        # With DeepSpeed ZeRO-3, adapter parameters are sharded and must be gathered before saving.
-        # GatheredParameters is a collective operation — all ranks must participate — so we call it
-        # outside the is_main_process guard, but only main process writes to disk.
+        if (self.is_fsdp_enabled):
+            raise NotImplementedError("FSDP is not supported for LoRA adapter sync.")
+
+        # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         if zero_stage_3:
@@ -495,10 +496,12 @@ class VLLMGeneration:
                 os.rename(tmp_dir, adapter_dir)
 
                 # Tell vLLM to reload
+                logger.info("Saved LoRA adapter snapshot to '%s'; requesting vLLM reload...", adapter_dir)
                 self.vllm_client.load_lora_adapter(
                     lora_name=self.lora_name,
                     lora_path=adapter_dir,
                 )
+                logger.info("vLLM LoRA reload completed for adapter '%s'.", self.lora_name)
 
         # Sync all processes
         if accelerator.num_processes > 1:
@@ -608,7 +611,7 @@ class VLLMGeneration:
         max_completion_length = self.max_completion_length
         processing_class = self.processing_class
         chat_template_kwargs = self.chat_template_kwargs
-        tools = self.tools
+        tools = self.tools or None
         chat_template = self.chat_template
 
         # Wake up colocated vLLM instances if needed
