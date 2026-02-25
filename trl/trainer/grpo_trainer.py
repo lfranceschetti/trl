@@ -543,6 +543,16 @@ class GRPOTrainer(BaseTrainer):
                     'vllm_sync_strategy="lora_adapter" requires a PEFT model. '
                     "Pass a peft_config or a pre-wrapped PeftModel."
                 )
+            # Only standard LoRA (including rsLoRA) is supported by vLLM's native adapter serving.
+            # Other adapter types (DoRA, IA3, etc.) must use the "weights" strategy instead.
+            peft_config = model.peft_config[model.active_adapter]
+            if peft_config.peft_type.value != "LORA":
+                raise ValueError(
+                    f'vllm_sync_strategy="lora_adapter" only supports LoRA adapters, '
+                    f"but the active adapter uses {peft_config.peft_type.value}. "
+                    'Use vllm_sync_strategy="weights" instead.'
+                )
+
         self.use_liger_kernel = args.use_liger_kernel
         self.loss_type = args.loss_type
         self.multi_objective_aggregation = args.multi_objective_aggregation
