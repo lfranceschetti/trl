@@ -1,4 +1,6 @@
 *.bak
+*.out
+*.err
 .gitattributes
 .last_checked
 .gitconfig

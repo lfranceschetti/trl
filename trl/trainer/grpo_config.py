@@ -539,13 +539,6 @@ class GRPOConfig(BaseConfig):
             'vllm_mode="server" with PEFT models.'
         },
     )
-    vllm_lora_rank: int = field(
-        default=64,
-        metadata={
-            "help": "Max LoRA rank for vLLM server (must be >= actual adapter rank). Only used with "
-            "vllm_sync_strategy='lora_adapter'."
-        },
-    )
 
     # Parameters that control colocated vLLM execution (only used when `vllm_mode` is `"colocate"`)
     vllm_gpu_memory_utilization: float = field(

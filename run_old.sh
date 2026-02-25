@@ -4,8 +4,8 @@
 #SBATCH --nodes=1                # Number of nodes
 #SBATCH --ntasks=1          
 #SBATCH --gpus=rtx_4090:2
-#SBATCH --output=run_test.out
-#SBATCH --error=run_test.err
+#SBATCH --output=run_old_sync_strategy.out
+#SBATCH --error=run_old_sync_strategy.err
 
 
 set -euo pipefail
@@ -85,7 +85,8 @@ python -m pip install -U \
   "peft<0.18" \
   "deepspeed" \
   wandb \
-  math_verify 
+  math_verify \
+  bitsandbytes
 
 
 
@@ -166,7 +167,8 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch \
   --mixed_precision bf16 \
   --dynamo_backend no \
   "$TRL_REPO/run_test.py" \
-  --quantized
+  --quantized \
+  --vllm-sync-strategy "weights"
 # Cleanup server
 echo "Stopping vLLM server..."
 kill $VLLM_PID || true

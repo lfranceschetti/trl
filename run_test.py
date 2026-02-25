@@ -3,6 +3,9 @@ import os
 from datasets import Dataset
 from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
+import argparse
+import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 
 def reward_function(completions, **kwargs):
@@ -32,7 +35,7 @@ def reward_function(completions, **kwargs):
 
 
 
-def main() -> None:
+def main(cli_args: argparse.Namespace) -> None:
     host = os.environ.get("VLLM_SERVER_HOST", "127.0.0.1")
     port = int(os.environ.get("VLLM_SERVER_PORT", "8000"))
     model_id = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B-Instruct")
@@ -56,7 +59,7 @@ def main() -> None:
         target_modules="all-linear",
     )
 
-    args = GRPOConfig(
+    train_args = GRPOConfig(
         output_dir="outputs/grpo_lora_length_reward",
         run_name="grpo_lora_length_reward",
         learning_rate=5e-5,
@@ -65,14 +68,13 @@ def main() -> None:
         vllm_server_host=host,
         vllm_server_port=port,
         # This is your new flag:
-        vllm_sync_strategy="lora_adapter",
-        vllm_lora_rank=64,
+        vllm_sync_strategy=cli_args.vllm_sync_strategy,
         logging_steps=5,
         save_strategy="no",
         report_to="wandb",
     )
 
-    if args.quantized:
+    if cli_args.quantized:
         print("Loading quantized model...")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -93,7 +95,7 @@ def main() -> None:
 
     trainer = GRPOTrainer(
         model=model,
-        args=args,
+        args=train_args,
         reward_funcs=reward_function,
         train_dataset=dataset,
         peft_config=peft_config,
@@ -108,5 +110,6 @@ def main() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--quantized", action="store_true", default=False)
-    args = parser.parse_args()
-    main(args)
+    parser.add_argument("--vllm-sync-strategy", type=str, default="weights", choices=["weights", "lora_adapter"])
+    cli_args = parser.parse_args()
+    main(cli_args)

@@ -69,11 +69,7 @@ vllm_sync_strategy: str = field(
         "disk and tell vLLM to reload it (requires vLLM --enable-lora). Only applies to "
         'vllm_mode="server" with PEFT models.'
     },
-)
-vllm_lora_rank: int = field(
-    default=64,
-    metadata={"help": "Max LoRA rank for vLLM server (must be >= actual adapter rank). Only used with vllm_sync_strategy='lora_adapter'."},
-)
+
 ```
 
 Add validation in `GRPOTrainer.__init__()`:
