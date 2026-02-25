@@ -32,7 +32,6 @@ def main() -> None:
         vllm_server_port=port,
         # This is your new flag:
         vllm_sync_strategy="lora_adapter",
-        vllm_lora_name="policy",
         vllm_lora_rank=64,
         logging_steps=5,
         save_strategy="no",

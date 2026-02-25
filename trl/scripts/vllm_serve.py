@@ -959,7 +959,6 @@ def main(script_args: ScriptArguments):
         return {"message": "Request received, closing communicator"}
 
     class LoadLoRARequest(BaseModel):
-        lora_name: str
         lora_path: str
 
     @app.post("/load_lora_adapter/")
@@ -969,9 +968,10 @@ def main(script_args: ScriptArguments):
         """
         from vllm.lora.request import LoRARequest as VLLMLoRARequest
 
+        lora_name = "policy"
         logger.info(
             "Received LoRA load request: lora_name='%s', lora_path='%s', path_exists=%s",
-            request.lora_name,
+            lora_name,
             request.lora_path,
             os.path.isdir(request.lora_path),
         )
@@ -980,17 +980,17 @@ def main(script_args: ScriptArguments):
         prev = lora_state["request"]
         new_id = (prev.lora_int_id + 1) if prev is not None else 1
         lora_state["request"] = VLLMLoRARequest(
-            lora_name=request.lora_name,
+            lora_name=lora_name,
             lora_int_id=new_id,
             lora_path=request.lora_path,
         )
         logger.info(
             "LoRA adapter registered for reload: lora_name='%s', lora_int_id=%s, lora_path='%s'",
-            request.lora_name,
+            lora_name,
             new_id,
             request.lora_path,
         )
-        return {"status": "success", "lora_name": request.lora_name, "lora_int_id": new_id}
+        return {"status": "success", "lora_int_id": new_id}
 
     class ChatCompletionRequest(BaseModel):
         messages: list[dict]

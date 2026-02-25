@@ -192,7 +192,6 @@ class VLLMGeneration:
         mode: str = "server",
         structured_outputs_regex: str | None = None,
         sync_strategy: str = "weights",
-        lora_name: str = "policy",
         # Server mode configuration
         server_base_url: str | None = None,
         server_host: str = "0.0.0.0",
@@ -229,7 +228,7 @@ class VLLMGeneration:
         self.mode = mode
         self.structured_outputs_regex = structured_outputs_regex
         self.sync_strategy = sync_strategy
-        self.lora_name = lora_name
+        self.lora_name = "policy"
 
         # Server mode configuration
         self.server_base_url = server_base_url
@@ -497,10 +496,7 @@ class VLLMGeneration:
 
                 # Tell vLLM to reload
                 logger.info("Saved LoRA adapter snapshot to '%s'; requesting vLLM reload...", adapter_dir)
-                self.vllm_client.load_lora_adapter(
-                    lora_name=self.lora_name,
-                    lora_path=adapter_dir,
-                )
+                self.vllm_client.load_lora_adapter(lora_path=adapter_dir)
                 logger.info("vLLM LoRA reload completed for adapter '%s'.", self.lora_name)
 
         # Sync all processes

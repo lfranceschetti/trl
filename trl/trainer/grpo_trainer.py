@@ -728,7 +728,6 @@ class GRPOTrainer(BaseTrainer):
                 mode=args.vllm_mode,
                 structured_outputs_regex=args.vllm_structured_outputs_regex,
                 sync_strategy=args.vllm_sync_strategy,
-                lora_name=args.vllm_lora_name,
                 # Server mode configuration
                 server_base_url=args.vllm_server_base_url,
                 server_host=args.vllm_server_host,

@@ -36,7 +36,7 @@ All paths relative to the TRL repo root. Target branch: `main` (latest stable is
 
 | File | What it does | What changes |
 |------|-------------|--------------|
-| `trl/trainer/grpo_config.py` | Defines `GRPOConfig` dataclass | Add `vllm_sync_strategy`, `vllm_lora_name`, `vllm_lora_rank` fields |
+| `trl/trainer/grpo_config.py` | Defines `GRPOConfig` dataclass | Add `vllm_sync_strategy`, `vllm_lora_rank` fields |
 | `trl/trainer/grpo_trainer.py` | Contains `GRPOTrainer` | Add `_move_lora_to_vllm()` method, branch in `_move_model_to_vllm()` |
 | `trl/scripts/vllm_serve.py` | FastAPI server with `WeightSyncWorker` | Add `/load_lora_adapter/` and `/unload_lora_adapter/` endpoints, start LLM with `enable_lora` when strategy is `lora_adapter` |
 | `trl/extras/vllm_client.py` | HTTP client wrapper used by trainer | Add `load_lora_adapter()` method |
@@ -70,10 +70,6 @@ vllm_sync_strategy: str = field(
         'vllm_mode="server" with PEFT models.'
     },
 )
-vllm_lora_name: str = field(
-    default="policy",
-    metadata={"help": "Name for the LoRA adapter registered with the vLLM server."},
-)
 vllm_lora_rank: int = field(
     default=64,
     metadata={"help": "Max LoRA rank for vLLM server (must be >= actual adapter rank). Only used with vllm_sync_strategy='lora_adapter'."},
@@ -89,13 +85,10 @@ Add validation in `GRPOTrainer.__init__()`:
 Add to `VLLMClient`:
 
 ```python
-def load_lora_adapter(self, lora_name: str, lora_path: str) -> None:
+def load_lora_adapter(self, lora_path: str) -> None:
     """Tell the vLLM server to load/reload a LoRA adapter from disk."""
     url = f"http://{self.host}:{self.server_port}/load_lora_adapter/"
-    response = self.session.post(url, json={
-        "lora_name": lora_name,
-        "lora_path": lora_path,
-    })
+    response = self.session.post(url, json={"lora_path": lora_path})
     response.raise_for_status()
 ```
 
@@ -138,7 +131,6 @@ Add endpoints:
 
 ```python
 class LoadLoRARequest(BaseModel):
-    lora_name: str
     lora_path: str
 
 @app.post("/load_lora_adapter/")
@@ -147,13 +139,13 @@ async def load_lora_adapter(request: LoadLoRARequest):
     nonlocal lora_request  # or use app.state
 
     new_lora = VLLMLoRARequest(
-        lora_name=request.lora_name,
-        lora_int_id=abs(hash(request.lora_name)) % (2**31),
+        lora_name="policy",
+        lora_int_id=abs(hash("policy")) % (2**31),
         lora_path=request.lora_path,
     )
     # Use vLLM's offline LLM API: pass lora_request per generate call
     lora_request = new_lora
-    return {"status": "success", "lora_name": request.lora_name}
+    return {"status": "success"}
 ```
 
 The `/generate/` endpoint must forward the `lora_request` to `llm.generate()`:
@@ -191,10 +183,7 @@ def _move_lora_to_vllm(self):
         os.rename(tmp_dir, adapter_dir)
 
         # Tell vLLM to reload
-        self.vllm_client.load_lora_adapter(
-            lora_name=self.args.vllm_lora_name,
-            lora_path=adapter_dir,
-        )
+        self.vllm_client.load_lora_adapter(lora_path=adapter_dir)
 
     # Sync all processes
     if self.accelerator.num_processes > 1:

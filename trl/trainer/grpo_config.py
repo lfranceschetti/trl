@@ -539,10 +539,6 @@ class GRPOConfig(BaseConfig):
             'vllm_mode="server" with PEFT models.'
         },
     )
-    vllm_lora_name: str = field(
-        default="policy",
-        metadata={"help": "Name for the LoRA adapter registered with the vLLM server."},
-    )
     vllm_lora_rank: int = field(
         default=64,
         metadata={
