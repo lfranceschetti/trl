@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --time=3:00:00          # Max runtime
+#SBATCH --time=23:00:00          # Max runtime
 #SBATCH --mem-per-cpu=50G         # Memory per CPU
 #SBATCH --nodes=1                # Number of nodes
 #SBATCH --ntasks=1          
 #SBATCH --gpus=rtx_4090:2
-#SBATCH --output=run_old_sync_strategy.out
-#SBATCH --error=run_old_sync_strategy.err
+#SBATCH --output=run_old_repetition.out
+#SBATCH --error=run_old_repetition.err
 
 
 set -euo pipefail
@@ -41,6 +41,8 @@ fi
 
 # Keep the same accelerate config override from grpo_test.sh for consistency.
 export ACCELERATE_CONFIG="/cluster/home/fraluca/.cache/huggingface/accelerate/default_config.yaml"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 
 mkdir -p logs
 
@@ -51,8 +53,8 @@ nvidia-smi
 # --- User config ---
 # Path to your local TRL checkout (this repo, with your PR changes)
 VLLM_PORT="${VLLM_PORT:-8000}"
-MODEL_ID="${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
-RUN_NAME="${RUN_NAME:-grpo_lora_length_reward}"
+MODEL_ID="${MODEL_NAME:-Qwen/Qwen2-0.5B-Instruct}"
+RUN_NAME="${RUN_NAME:-vllm_sync_weight}"
 WANDB_PROJECT="${WANDB_PROJECT:-grpo_lora_length_reward}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 
@@ -114,8 +116,6 @@ trl vllm-serve \
   --data-parallel-size 1 \
   --gpu-memory-utilization 0.8 \
   --max-model-len 4096 \
-  --enable_lora \
-  --max_lora_rank 64 \
   > "logs/vllm_server_${SLURM_JOB_ID:-manual}.log" 2>&1 &
 
 VLLM_PID=$!
@@ -167,8 +167,10 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch \
   --mixed_precision bf16 \
   --dynamo_backend no \
   "$TRL_REPO/run_test.py" \
-  --quantized \
-  --vllm-sync-strategy "weights"
+  --vllm-sync-strategy "weights" \
+  --run-name "$RUN_NAME" \
+  --env "repetition"
+  # --quantized \
 # Cleanup server
 echo "Stopping vLLM server..."
 kill $VLLM_PID || true

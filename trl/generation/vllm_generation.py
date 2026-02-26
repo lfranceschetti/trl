@@ -390,8 +390,8 @@ class VLLMGeneration:
 
         # For FSDP2, module.state_dict() already covers all parameters, so no need for recursion
         for name, param in module.state_dict().items():
-            # When using PEFT, we need to recover the original parameter name
-            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+            # When using PEFT, recover the original parameter namespace.
+            name = name.removeprefix("base_model.model.")
             # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
             if is_peft_model(module) and module.prefix in name:
                 continue
@@ -540,15 +540,17 @@ class VLLMGeneration:
                 else:
                     # DeepSpeed ZeRO-3 with PEFT
                     for name, param in model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                        # When using PEFT, recover the original parameter namespace.
+                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")    
                         # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
                         if model.prefix in name:
                             continue
                         # When module to save, remove its prefix and discard the original module
                         if "original_module" in name:
                             continue
+
                         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+
 
                         if self.mode == "server" and accelerator.is_main_process:
                             self.vllm_client.update_named_param(name, param.data)

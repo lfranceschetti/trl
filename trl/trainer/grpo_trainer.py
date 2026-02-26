@@ -1230,11 +1230,10 @@ class GRPOTrainer(BaseTrainer):
         if self.use_vllm:
             # Sync weights if training step changed
             if self.state.global_step != self._last_loaded_step:
-                if self.args.vllm_sync_strategy == "lora_adapter":
-                    with profiling_context(self, "sync_lora_adapter"):
+                with profiling_context(self, "sync_weights"):
+                    if self.args.vllm_sync_strategy == "lora_adapter":
                         self.vllm_generation.sync_lora_adapter(self.args.output_dir)
-                else:
-                    with profiling_context(self, "sync_weights"):
+                    else:
                         self.vllm_generation.sync_weights()
                         
                 self._last_loaded_step = self.state.global_step

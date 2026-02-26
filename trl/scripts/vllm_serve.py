@@ -158,6 +158,12 @@ class WeightSyncWorkerExtension:
         # The client process that sends updated weights has the highest rank (world_size - 1).
         self.client_rank = world_size - 1
 
+        # Log once per worker when weight-sync is initialized to make incoming name mismatches easier to debug.
+        model = self.model_runner.model
+        param_names = [name for name, _ in model.named_parameters()]
+        logger.info(f"[init_communicator] present_param_count={len(param_names)}")
+        logger.info(f"[init_communicator] present_param_names={param_names}")
+
     def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
         """
         Receives updated weights from the client process and updates the named parameter in the model.
@@ -187,6 +193,8 @@ class WeightSyncWorkerExtension:
             self.communicator.group.barrier()
 
         # Load the received weights into the model.
+
+        logger.info(f"[update_named_param] received name: {name}, weight: {weight.shape}")
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
     def close_communicator(self) -> None:

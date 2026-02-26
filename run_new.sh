@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --time=3:00:00          # Max runtime
+#SBATCH --time=3:59:00          # Max runtime
 #SBATCH --mem-per-cpu=50G         # Memory per CPU
 #SBATCH --nodes=1                # Number of nodes
 #SBATCH --ntasks=1          
 #SBATCH --gpus=rtx_4090:2
-#SBATCH --output=run_new_sync_strategy.out
-#SBATCH --error=run_new_sync_strategy.err
+#SBATCH --output=run_new_repetition.out
+#SBATCH --error=run_new_repetition.err
 
 
 set -euo pipefail
@@ -51,8 +51,8 @@ nvidia-smi
 # --- User config ---
 # Path to your local TRL checkout (this repo, with your PR changes)
 VLLM_PORT="${VLLM_PORT:-8000}"
-MODEL_ID="${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
-RUN_NAME="${RUN_NAME:-grpo_lora_length_reward}"
+MODEL_ID="${MODEL_NAME:-Qwen/Qwen2-0.5B-Instruct}"
+RUN_NAME="${RUN_NAME:-vllm_sync_lora}"
 WANDB_PROJECT="${WANDB_PROJECT:-grpo_lora_length_reward}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 
@@ -167,8 +167,10 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch \
   --mixed_precision bf16 \
   --dynamo_backend no \
   "$TRL_REPO/run_test.py" \
-  --quantized \
-  --vllm-sync-strategy "lora_adapter"
+  --vllm-sync-strategy "lora_adapter" \
+  --run-name "$RUN_NAME" \
+  --env "repetition" \
+  --quantized 
 # Cleanup server
 echo "Stopping vLLM server..."
 kill $VLLM_PID || true
