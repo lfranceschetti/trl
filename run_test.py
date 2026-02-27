@@ -9,6 +9,8 @@ from trl.rewards import accuracy_reward
 import argparse
 import torch
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from unsloth import FastLanguageModel
+
 
 
 # ── Word-repetition environment ────────────────────────────────────────────────
@@ -94,32 +96,50 @@ def main(cli_args: argparse.Namespace) -> None:
     output_dir = f"outputs/{run_name}"
 
     if cli_args.quantized:
-        print("Loading quantized model...")
-        bnb_config = BitsAndBytesConfig(
+        # 1. Load model with Unsloth
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_id,
+            max_seq_length=2048,
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_storage=torch.bfloat16,
+            fast_inference=True,       # enables vLLM internally
+            max_lora_rank=8,
+            gpu_memory_utilization=0.6,
         )
+
+        # 2. Add LoRA adapters
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=8,
+            lora_alpha=16,
+            lora_dropout=0.05,
+            bias="none",
+            target_modules=[           # Unsloth doesn't support "all-linear"
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            use_gradient_checkpointing="unsloth",
+        )
+
+        peft_config = None
+
     else:
         bnb_config = None
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        )
 
-    peft_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules="all-linear",
-    )
+        peft_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules="all-linear",
+        )
 
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()

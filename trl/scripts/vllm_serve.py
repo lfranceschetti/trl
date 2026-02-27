@@ -60,7 +60,7 @@ if is_vllm_available():
     import vllm
     from vllm import LLM, SamplingParams
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.parallel_state import get_world_group
+    from vllm.distributed.parallel_state import get_world_groupBu
     from vllm.distributed.utils import StatelessProcessGroup
 
     if Version(vllm.__version__) <= Version("0.11.0"):
@@ -354,6 +354,22 @@ class ScriptArguments:
         default=64,
         metadata={"help": "Maximum LoRA rank. Must be >= the rank of any adapter that will be loaded."},
     )
+    quantization: str | None = field(
+        default=None,
+        metadata={
+            "help": "Method used to quantize the weights. Supported values include 'bitsandbytes', 'awq', 'gptq', "
+            "'fp8', etc. If None, vLLM will check the model's quantization_config. "
+            "See vLLM docs for full list of supported methods."
+        },
+    )
+    load_format: str | None = field(
+        default=None,
+        metadata={
+            "help": "The format of the model weights to load. E.g. 'bitsandbytes', 'auto', 'safetensors'. "
+            "Required when using certain quantization methods like bitsandbytes."
+        },
+    )
+
 
 
 def llm_worker(
@@ -384,10 +400,17 @@ def llm_worker(
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         "logprobs_mode": "processed_logprobs",
     }
+    
+    # Add quantization args if provided
+    if script_args.quantization is not None:
+        llm_kwargs["quantization"] = script_args.quantization
+    if script_args.load_format is not None:
+        llm_kwargs["load_format"] = script_args.load_format
+
     if script_args.enable_lora:
         llm_kwargs["enable_lora"] = True
         llm_kwargs["max_lora_rank"] = script_args.max_lora_rank
-        llm_kwargs["max_loras"] = 2
+        llm_kwargs["max_loras"] = 16
     llm = LLM(**llm_kwargs)
 
     # Send ready signal to parent process

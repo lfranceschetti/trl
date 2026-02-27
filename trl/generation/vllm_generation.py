@@ -85,6 +85,12 @@ def extract_logprobs(all_outputs: list["RequestOutput"]):
     for outputs in all_outputs:
         for output in outputs.outputs:
             if output.logprobs is None:
+                logger.warning(
+                    f"None logprobs at output[{i}].outputs[{j}]: "
+                    f"num_tokens={len(output.token_ids)}, "
+                    f"finish_reason={output.finish_reason}, "
+                    f"text_len={len(output.text)}"
+                )
                 return None, None
             seq_logprobs = []
             seq_token_ids = []

@@ -145,3 +145,5 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+
+unsloth_compiled_cache/
